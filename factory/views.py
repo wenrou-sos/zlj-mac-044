@@ -168,12 +168,21 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         serializer.save()
         self._sync_machine_status()
 
-    def _sync_machine_status(self):
+    def perform_destroy(self, instance):
+        machine_id = instance.machine_id
+        instance.delete()
+        # 删除排产后，受影响机台若已无未完成任务，回退为空闲
+        self._sync_machine_status(machine_id)
+
+    def _sync_machine_status(self, only_machine_id=None):
         cur = today()
-        for machine in Machine.objects.all():
-            has_today = machine.schedules.filter(planned_date__lte=cur, done=False).exists()
+        qs = Machine.objects.all()
+        if only_machine_id:
+            qs = qs.filter(pk=only_machine_id)
+        for machine in qs:
+            has_pending = machine.schedules.filter(planned_date__lte=cur, done=False).exists()
             if machine.status != Machine.Status.MAINTENANCE:
-                machine.status = Machine.Status.RUNNING if has_today else Machine.Status.IDLE
+                machine.status = Machine.Status.RUNNING if has_pending else Machine.Status.IDLE
                 machine.save(update_fields=['status'])
 
 

@@ -393,7 +393,7 @@ const Orders = {
 
           <div class="panel" style="box-shadow:none;border:1px solid #ebeef5">
             <div class="panel-title">工序进度（印前 → 印刷 → 装订）
-              <el-button type="primary" size="small" @click="progressDialog=true">更新进度</el-button>
+              <el-button type="primary" size="small" @click="openProgress">更新进度</el-button>
             </div>
             <el-row :gutter="16">
               <el-col :span="8" v-for="st in STAGES" :key="st.key">
