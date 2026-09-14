@@ -461,7 +461,8 @@ const Orders = {
           <el-form-item v-for="st in STAGES" :key="st.key" :label="st.label">
             <div style="width:100%">
               <el-radio-group v-model="pform[st.status]" size="small" style="margin-bottom:10px">
-                <el-radio-button v-for="(ss, sk) in STAGE_STATUS" :key="sk" :label="sk" :disabled="sk==='rework'">{{ ss.label }}</el-radio-button>
+                <el-radio-button v-for="(ss, sk) in STAGE_STATUS" :key="sk" :label="sk"
+                  :disabled="sk==='rework' || (sk==='done' && !canMarkDone(st.key))">{{ ss.label }}</el-radio-button>
               </el-radio-group>
               <el-slider v-model="pform[st.progress]" :show-input="true" :max="100"></el-slider>
               <el-input v-model="pform[st.note]" placeholder="工序说明（如：正在调墨/待覆膜）" size="small" style="margin-top:6px"></el-input>
@@ -600,6 +601,13 @@ const Orders = {
             if (s === 'rework') return 'exception';
             if (s === 'done') return 'success';
             return '';
+        }
+
+        // 工序顺序：印刷完成要求印前完成；装订完成要求印前、印刷都完成
+        function canMarkDone(stage) {
+            if (stage === 'prepress') return true;
+            if (stage === 'printing') return pform['prepress_status'] === 'done';
+            return pform['prepress_status'] === 'done' && pform['printing_status'] === 'done';
         }
 
         async function load() {
@@ -743,7 +751,7 @@ const Orders = {
             formVisible, editing, form, detailVisible, detail,
             progressDialog, pform, schedDialog, sform, reworkDialog, rform,
             ORDER_STATUS, STAGE_STATUS, STAGES, REWORK_STATUS, REWORK_REASONS, WARNING_LEVEL,
-            formatNum, stageClass, activeStage, progressStatus,
+            formatNum, stageClass, activeStage, progressStatus, canMarkDone,
             load, reset, openCreate, openEdit, saveOrder, openDetail,
             openProgress, saveProgress, openSchedule, saveSchedule, toggleSchedule,
             openRework, saveRework,

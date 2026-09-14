@@ -53,6 +53,12 @@ class ProcessProgressSerializer(serializers.ModelSerializer):
     }
 
     def validate(self, attrs):
+        # 合并实例当前值，使部分更新(PATCH)也能做整体顺序校验
+        merged = {}
+        for stage, (s_field, p_field, _) in self.STAGE_ATTRS.items():
+            merged[s_field] = attrs.get(s_field, getattr(self.instance, s_field, None))
+            merged[p_field] = attrs.get(p_field, getattr(self.instance, p_field, None))
+
         # 校验进度值 0-100，状态与进度一致性
         for stage, (s_field, p_field, _) in self.STAGE_ATTRS.items():
             status = attrs.get(s_field)
@@ -63,6 +69,20 @@ class ProcessProgressSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({p_field: '状态为已完成时进度应为 100%'})
             if status == 'not_started' and progress is not None and progress > 0:
                 raise serializers.ValidationError({p_field: '状态为未开始时进度应为 0%'})
+
+        # 工序顺序校验：印刷完成前印前必须完成；装订完成前印前、印刷必须完成
+        if merged['printing_status'] == 'done' and merged['prepress_status'] != 'done':
+            raise serializers.ValidationError(
+                {'printing_status': '印前工序尚未完成，不能将印刷标记为已完成'})
+        if merged['binding_status'] == 'done':
+            unfinished = []
+            if merged['prepress_status'] != 'done':
+                unfinished.append('印前')
+            if merged['printing_status'] != 'done':
+                unfinished.append('印刷')
+            if unfinished:
+                raise serializers.ValidationError(
+                    {'binding_status': f'{"、".join(unfinished)}尚未完成，不能将装订标记为已完成'})
         return attrs
 
     def update(self, instance, validated_data):

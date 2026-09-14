@@ -161,9 +161,11 @@ class ProcessProgress(models.Model):
 
         if open_rework or 'rework' in stages:
             new_status = Order.Status.REWORK
-        elif self.binding_status == 'done':
+        elif self.prepress_status == 'done' and self.printing_status == 'done' \
+                and self.binding_status == 'done':
+            # 必须三道工序全部完成才算完工
             new_status = Order.Status.COMPLETED
-        elif self.binding_status == 'in_progress':
+        elif self.binding_status in ('in_progress', 'done'):
             new_status = Order.Status.BINDING
         elif self.printing_status in ('in_progress', 'done'):
             new_status = Order.Status.PRINTING

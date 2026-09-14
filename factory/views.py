@@ -37,11 +37,25 @@ class PaperViewSet(viewsets.ModelViewSet):
     queryset = Paper.objects.all().order_by('name')
     serializer_class = PaperSerializer
 
+    @staticmethod
+    def _parse_qty(request):
+        """解析出入库数量；非法或为空时抛出 ValidationError(400)"""
+        raw = request.data.get('quantity')
+        if raw in (None, ''):
+            from rest_framework.serializers import ValidationError
+            raise ValidationError({'quantity': '数量不能为空'})
+        try:
+            qty = int(raw)
+        except (TypeError, ValueError):
+            from rest_framework.serializers import ValidationError
+            raise ValidationError({'quantity': '数量必须为整数'})
+        return qty
+
     @action(detail=True, methods=['post'])
     def stock_in(self, request, pk=None):
         """入库：增加库存并写流水"""
         paper = self.get_object()
-        qty = int(request.data.get('quantity', 0))
+        qty = self._parse_qty(request)
         if qty <= 0:
             return Response({'detail': '入库数量必须大于 0'}, status=400)
         with transaction.atomic():
@@ -49,7 +63,7 @@ class PaperViewSet(viewsets.ModelViewSet):
             paper.save(update_fields=['stock'])
             PaperTransaction.objects.create(
                 paper=paper, tx_type=PaperTransaction.TxType.IN, quantity=qty,
-                tx_date=today(), note=request.data.get('note', '采购入库'),
+                tx_date=today(), note=request.data.get('note') or '采购入库',
             )
         return Response(PaperSerializer(paper).data)
 
@@ -57,7 +71,7 @@ class PaperViewSet(viewsets.ModelViewSet):
     def stock_out(self, request, pk=None):
         """出库（领料）：扣减库存并写流水"""
         paper = self.get_object()
-        qty = int(request.data.get('quantity', 0))
+        qty = self._parse_qty(request)
         if qty <= 0:
             return Response({'detail': '出库数量必须大于 0'}, status=400)
         if qty > paper.stock:
@@ -72,7 +86,7 @@ class PaperViewSet(viewsets.ModelViewSet):
             PaperTransaction.objects.create(
                 paper=paper, tx_type=PaperTransaction.TxType.OUT, quantity=qty,
                 order=order, tx_date=today(),
-                note=request.data.get('note', '生产领料'),
+                note=request.data.get('note') or '生产领料',
             )
         return Response(PaperSerializer(paper).data)
 
