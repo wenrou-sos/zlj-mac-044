@@ -2,16 +2,21 @@ from datetime import date, timedelta
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.db.models import Q, Sum
 
 from factory.models import (
     Customer,
     Machine,
     Order,
     Paper,
+    PaperBatch,
     PaperTransaction,
     ReworkRecord,
     Schedule,
 )
+
+Q_IN = Q(tx_type=PaperTransaction.TxType.IN)
+Q_OUT = Q(tx_type=PaperTransaction.TxType.OUT)
 
 
 class Command(BaseCommand):
@@ -24,6 +29,7 @@ class Command(BaseCommand):
         Schedule.objects.all().delete()
         Order.objects.all().delete()
         PaperTransaction.objects.all().delete()
+        PaperBatch.objects.all().delete()
         Paper.objects.all().delete()
         Machine.objects.all().delete()
         Customer.objects.all().delete()
@@ -42,7 +48,7 @@ class Command(BaseCommand):
 
         # ---------------- 纸张 ----------------
         papers_data = [
-            # 名称, 类型, 规格, 库存, 安全库存, 单价
+            # 名称, 类型, 规格, 目标库存, 安全库存, 单价
             ('金东铜版纸', 'coated', '157g/889×1194', 1200, 3000, '0.85'),
             ('金东铜版纸', 'coated', '200g/889×1194', 8600, 3000, '1.05'),
             ('亚太胶版纸', 'offset', '80g/787×1092', 42000, 10000, '0.32'),
@@ -55,7 +61,7 @@ class Command(BaseCommand):
         for name, ptype, spec, stock, safety, price in papers_data:
             p = Paper.objects.create(
                 name=name, paper_type=ptype, spec=spec,
-                stock=stock, safety_stock=safety, unit_price=price,
+                stock=0, safety_stock=safety, unit_price=price,
             )
             papers[spec] = p
 
@@ -194,26 +200,115 @@ class Command(BaseCommand):
             result='200 本全部重订，全检后入库；已对装订机订头做校准保养。',
         )
 
-        # ---------------- 用纸出库流水 ----------------
-        for order in [o1, o2, o3, o4, o5, o7, o8]:
-            PaperTransaction.objects.create(
-                paper=order.paper, tx_type='out', quantity=order.paper_consumption,
-                order=order, tx_date=order.order_date + timedelta(days=1),
-                note=f'{order.order_no} 生产领料',
-            )
+        # ---------------- 纸张批次入库 ----------------
+        # 批次定义：(到货偏移天数, 保质期天数 None=无, 入库量)
+        # 刻意构造 已过期 / 临期(≤30天) / 正常 三种效期，便于展示 FEFO 与预警
+        batch_plans = {
+            '157g/889×1194': [
+                (-400, 365, 6600),   # 已过期（到期日 = 今天-35天），领料 6200 后余 400
+                (-60, 72, 800),      # 临期（到期日 = 今天+12天），未动用
+            ],
+            '200g/889×1194': [
+                (-380, 365, 1500),   # 已过期，出库时被 FEFO 优先消耗完
+                (-20, 42, 5100),     # 临期（到期日 = 今天+22天），余 100
+                (-10, 365, 8500),    # 正常
+            ],
+            '80g/787×1092': [
+                (-420, 365, 10000),  # 已过期，全部被早期领料消耗
+                (-25, 45, 18000),    # 临期（到期日 = 今天+20天），余 14500
+                (-8, 365, 27500),    # 正常
+            ],
+            '70g/787×1092': [
+                (-18, 40, 27000),    # 临期（到期日 = 今天+22天），余 1000
+                (-6, 365, 35000),    # 正常
+            ],
+            '300g/889×1194': [
+                (-120, 90, 1800),    # 已过期（到期日 = 今天-30天），被消耗完
+                (-15, 35, 7000),     # 临期（到期日 = 今天+20天），余 500
+                (-5, 365, 9000),     # 正常
+            ],
+            '120g/889×1194': [
+                (-30, 50, 9500),     # 临期（到期日 = 今天+20天），余 500
+                (-10, 365, 14500),   # 正常
+            ],
+            '250g/珠光/787×1092': [
+                (-200, 190, 4000),   # 已过期（到期日 = 今天-10天），领料 3600 后余 400
+                (-30, 45, 1800),     # 临期（到期日 = 今天+15天），未动用
+                (-5, 540, 1000),     # 正常
+            ],
+        }
 
-        # 期初入库 = 当前库存 + 累计出库，保证库存账实勾稽
+        batch_seq = {}
+
+        def create_batches(spec):
+            """按方案创建批次并登记入库流水，返回批次列表（按 FEFO 顺序）"""
+            paper = papers[spec]
+            created = []
+            for idx, (arr_off, shelf_days, in_qty) in enumerate(batch_plans[spec], start=1):
+                arrival = today + timedelta(days=arr_off)
+                expiry = arrival + timedelta(days=shelf_days) if shelf_days else None
+                batch_no = f'B{arrival.strftime("%Y%m%d")}-{idx:02d}'
+                batch = PaperBatch.objects.create(
+                    paper=paper, batch_no=batch_no,
+                    arrival_date=arrival, expiry_date=expiry, note='采购入库',
+                )
+                PaperTransaction.objects.create(
+                    paper=paper, batch=batch, tx_type='in', quantity=in_qty,
+                    tx_date=arrival, note='采购入库',
+                )
+                created.append(batch)
+            # FEFO：到期日早的优先，无保质期排最后
+            created.sort(key=lambda b: (b.expiry_date is None,
+                                        b.expiry_date or date.max,
+                                        b.arrival_date, b.id))
+            batch_seq[spec] = created
+            return created
+
+        for spec in batch_plans:
+            create_batches(spec)
+
+        # ---------------- 用纸出库（按 FEFO 从各批次扣减） ----------------
+        stock_out_orders = [o1, o2, o3, o4, o5, o7, o8]
+        # 按领料日期先后排序，便于按批次余量顺序消耗
+        stock_out_orders.sort(key=lambda o: (o.order_date + timedelta(days=1), o.id))
+        for order in stock_out_orders:
+            paper = order.paper
+            qty = order.paper_consumption
+            tx_d = order.order_date + timedelta(days=1)
+            left = qty
+            for batch in batch_seq[paper.spec]:
+                if left <= 0:
+                    break
+                # 实时计算该批次当前余量
+                agg = batch.transactions.aggregate(
+                    ins=Sum('quantity', filter=Q_IN),
+                    outs=Sum('quantity', filter=Q_OUT),
+                )
+                remaining = (agg['ins'] or 0) - (agg['outs'] or 0)
+                take = min(remaining, left)
+                if take <= 0:
+                    continue
+                PaperTransaction.objects.create(
+                    paper=paper, batch=batch, tx_type='out', quantity=take,
+                    order=order, tx_date=tx_d, note=f'{order.order_no} 生产领料',
+                )
+                left -= take
+            if left > 0:
+                self.stdout.write(self.style.WARNING(
+                    f'{paper.spec} 批次入库量不足以支撑 {order.order_no} 领料，缺口 {left} 张'))
+
+        # 库存 = 入库合计 - 出库合计，按流水回填保证账实勾稽
         for paper in papers.values():
-            from django.db.models import Sum
-            total_out = (paper.transactions.filter(tx_type='out')
-                         .aggregate(s=Sum('quantity'))['s'] or 0)
-            PaperTransaction.objects.create(
-                paper=paper, tx_type='in', quantity=int(paper.stock) + total_out,
-                tx_date=today - timedelta(days=30), note='期初库存',
+            agg = paper.transactions.aggregate(
+                ins=Sum('quantity', filter=Q_IN),
+                outs=Sum('quantity', filter=Q_OUT),
             )
+            paper.stock = (agg['ins'] or 0) - (agg['outs'] or 0)
+            paper.save(update_fields=['stock'])
 
         self.stdout.write(self.style.SUCCESS(
-            f'样例数据生成完成：客户 {customers.__len__()} 家、纸张 {len(papers_data)} 种、'
+            f'样例数据生成完成：客户 {len(customers)} 家、纸张 {len(papers_data)} 种'
+            f'（批次 {PaperBatch.objects.count()} 个）、'
             f'机台 {len(machines)} 台、订单 {len(orders_spec)} 个、'
             f'排产 {len(schedules)} 条、返工单 2 张'
         ))

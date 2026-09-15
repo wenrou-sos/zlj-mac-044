@@ -1,6 +1,5 @@
-from django.db import transaction
-from django.db.models import Count, Sum
-from .models import today
+from django.db.models import Sum
+from .models import today, BATCH_WARNING_DAYS
 from rest_framework import viewsets
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -10,6 +9,7 @@ from .models import (
     Machine,
     Order,
     Paper,
+    PaperBatch,
     PaperTransaction,
     ProcessProgress,
     ReworkRecord,
@@ -26,6 +26,13 @@ from .serializers import (
     ReworkSerializer,
     ScheduleSerializer,
 )
+from .services import (
+    compute_expiry,
+    fefo_batches,
+    parse_date,
+    stock_in as do_stock_in,
+    stock_out as do_stock_out,
+)
 
 
 class CustomerViewSet(viewsets.ModelViewSet):
@@ -34,13 +41,15 @@ class CustomerViewSet(viewsets.ModelViewSet):
 
 
 class PaperViewSet(viewsets.ModelViewSet):
-    queryset = Paper.objects.all().order_by('name')
+    queryset = Paper.objects.prefetch_related('batches__transactions').all().order_by('name')
     serializer_class = PaperSerializer
 
     @staticmethod
     def _parse_qty(request):
         """解析出入库数量；非法或为空时抛出 ValidationError(400)"""
         raw = request.data.get('quantity')
+        if raw in (None, '') and request.method == 'GET':
+            raw = request.query_params.get('quantity')
         if raw in (None, ''):
             from rest_framework.serializers import ValidationError
             raise ValidationError({'quantity': '数量不能为空'})
@@ -51,44 +60,94 @@ class PaperViewSet(viewsets.ModelViewSet):
             raise ValidationError({'quantity': '数量必须为整数'})
         return qty
 
+    def perform_create(self, serializer):
+        """直接录入期初库存时，补建一个“期初”批次，保证库存可追溯到批次"""
+        paper = serializer.save()
+        initial = int(paper.stock or 0)
+        if initial > 0:
+            arrival = today()
+            batch = PaperBatch.objects.create(
+                paper=paper, batch_no='QC-' + arrival.strftime('%Y%m%d'),
+                arrival_date=arrival, expiry_date=None, note='期初库存',
+            )
+            PaperTransaction.objects.create(
+                paper=paper, batch=batch, tx_type=PaperTransaction.TxType.IN,
+                quantity=initial, tx_date=arrival, note='期初库存',
+            )
+
     @action(detail=True, methods=['post'])
     def stock_in(self, request, pk=None):
-        """入库：增加库存并写流水"""
+        """批次入库：登记批次号、到货日期与保质期，增加批次/总库存并写流水"""
         paper = self.get_object()
         qty = self._parse_qty(request)
-        if qty <= 0:
-            return Response({'detail': '入库数量必须大于 0'}, status=400)
-        with transaction.atomic():
-            paper.stock += qty
-            paper.save(update_fields=['stock'])
-            PaperTransaction.objects.create(
-                paper=paper, tx_type=PaperTransaction.TxType.IN, quantity=qty,
-                tx_date=today(), note=request.data.get('note') or '采购入库',
-            )
-        return Response(PaperSerializer(paper).data)
+        arrival = parse_date(request.data.get('arrival_date'), 'arrival_date', default=today())
+        expiry = compute_expiry(
+            arrival,
+            request.data.get('shelf_life_days'),
+            request.data.get('expiry_date'),
+        )
+        batch, created = do_stock_in(
+            paper, qty,
+            batch_no=request.data.get('batch_no') or '',
+            arrival_date=arrival,
+            expiry_date=expiry,
+            note=request.data.get('note') or '',
+        )
+        paper.refresh_from_db()
+        msg = f'批次 {batch.batch_no} 已{"创建并" if created else ""}入库 {qty} 张'
+        if expiry:
+            msg += f'，保质期至 {expiry}'
+        return Response({'paper': PaperSerializer(paper).data, 'message': msg})
 
     @action(detail=True, methods=['post'])
     def stock_out(self, request, pk=None):
-        """出库（领料）：扣减库存并写流水"""
+        """批次出库（领料）：默认 FEFO 先到期先出，可手动指定各批次数量"""
         paper = self.get_object()
         qty = self._parse_qty(request)
-        if qty <= 0:
-            return Response({'detail': '出库数量必须大于 0'}, status=400)
-        if qty > paper.stock:
-            return Response({'detail': f'库存不足，当前库存 {paper.stock} 张'}, status=400)
         order = None
         order_id = request.data.get('order')
         if order_id:
             order = Order.objects.filter(pk=order_id).first()
-        with transaction.atomic():
-            paper.stock -= qty
-            paper.save(update_fields=['stock'])
-            PaperTransaction.objects.create(
-                paper=paper, tx_type=PaperTransaction.TxType.OUT, quantity=qty,
-                order=order, tx_date=today(),
-                note=request.data.get('note') or '生产领料',
-            )
-        return Response(PaperSerializer(paper).data)
+
+        allocations = request.data.get('allocations')
+        if allocations is not None and not isinstance(allocations, list):
+            return Response({'detail': 'allocations 必须为批次分配列表'}, status=400)
+
+        # 手动分配时由 service 逐批次校验余量；自动 FEFO 时先做总库存快速拦截
+        if allocations is None and qty > paper.stock:
+            return Response({'detail': f'库存不足，当前库存 {paper.stock} 张'}, status=400)
+
+        lines, used_expired = do_stock_out(
+            paper, qty, order=order,
+            note=request.data.get('note') or '',
+            allocations=allocations,
+        )
+        paper.refresh_from_db()
+        message = '出库成功，按批次扣减：' + '；'.join(
+            f'{l["batch_no"]} {l["quantity"]} 张' for l in lines)
+        if used_expired:
+            message = '⚠️ 本次出库包含已过期批次，请确认纸张仍可使用！' + message
+        return Response({'paper': PaperSerializer(paper).data,
+                         'allocations': lines, 'used_expired': used_expired,
+                         'message': message})
+
+    @action(detail=True, methods=['get'])
+    def fefo_plan(self, request, pk=None):
+        """给定出库数量预览 FEFO 分配方案"""
+        paper = self.get_object()
+        qty = self._parse_qty(request)
+        rows = []
+        left = qty
+        for b, remaining in fefo_batches(paper):
+            take = max(0, min(remaining, left))
+            left -= take if take else 0
+            rows.append({
+                'batch_id': b.id, 'batch_no': b.batch_no,
+                'arrival_date': b.arrival_date, 'expiry_date': b.expiry_date,
+                'remaining': remaining, 'days_to_expiry': b.days_to_expiry,
+                'expiry_state': b.expiry_state, 'take': take,
+            })
+        return Response({'qty': qty, 'shortage': max(0, left), 'plan': rows})
 
 
 class MachineViewSet(viewsets.ModelViewSet):
@@ -253,6 +312,27 @@ class DashboardViewSet(viewsets.ViewSet):
             for p in Paper.objects.all() if p.is_low
         ]
 
+        # 纸张批次效期预警：已过期 / 临期（BATCH_WARNING_DAYS 天内到期），只看仍有剩余的批次
+        expiring_batches, expired_batches = [], []
+        for p in Paper.objects.prefetch_related('batches__transactions'):
+            for b in p.batches.all():
+                remaining = b.remaining
+                if remaining <= 0:
+                    continue
+                state = b.expiry_state
+                if state not in ('expired', 'warning'):
+                    continue
+                row = {
+                    'id': b.id, 'paper_id': p.id, 'paper_name': p.name, 'spec': p.spec,
+                    'paper_type_display': p.get_paper_type_display(),
+                    'batch_no': b.batch_no, 'arrival_date': b.arrival_date,
+                    'expiry_date': b.expiry_date, 'remaining': remaining,
+                    'days_to_expiry': b.days_to_expiry, 'state': state,
+                }
+                (expired_batches if state == 'expired' else expiring_batches).append(row)
+        expired_batches.sort(key=lambda r: r['expiry_date'])
+        expiring_batches.sort(key=lambda r: r['expiry_date'])
+
         open_reworks = ReworkRecord.objects.exclude(status=ReworkRecord.Status.CLOSED).count()
         machines = Machine.objects.all()
         running = machines.filter(status=Machine.Status.RUNNING).count()
@@ -282,6 +362,8 @@ class DashboardViewSet(viewsets.ViewSet):
                 'urgent_count': len(urgent),
                 'warning_count': len(warning),
                 'low_paper_count': len(low_papers),
+                'expired_batch_count': len(expired_batches),
+                'expiring_batch_count': len(expiring_batches),
                 'open_rework_count': open_reworks,
                 'machine_total': machines.count(),
                 'machine_running': running,
@@ -291,6 +373,9 @@ class DashboardViewSet(viewsets.ViewSet):
             'urgent_orders': sorted(urgent, key=lambda x: x['days_left'])[:10],
             'warning_orders': warning[:10],
             'low_papers': low_papers,
+            'expired_batches': expired_batches[:20],
+            'expiring_batches': expiring_batches[:20],
+            'batch_warning_days': BATCH_WARNING_DAYS,
             'stage_stats': stage_stats,
             'weekly_load': load,
         })

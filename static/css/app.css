@@ -64,3 +64,24 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Helvetica Neue",
 
 .schedule-item { display:flex; align-items:flex-start; gap:8px; padding:8px 10px; margin-bottom:8px; border-radius:6px; background:#ecf5ff; border-left:3px solid #409eff; }
 .schedule-item.done { background:#f0f9eb; border-left-color:#67c23a; opacity:.85; }
+
+/* ---------- 纸张批次效期 ---------- */
+.alert-card { border-radius: 8px; padding: 14px 18px; display: flex; align-items: center; gap: 14px; cursor: pointer; color: #303133; transition: box-shadow .2s; }
+.alert-card:hover { box-shadow: 0 4px 14px rgba(0,0,0,.12); }
+.alert-card .alert-icon { font-size: 28px; flex-shrink: 0; }
+.alert-card .alert-num { font-size: 24px; font-weight: 700; line-height: 1.2; }
+.alert-card .alert-label { font-size: 13px; color: #606266; }
+.alert-card.expired { background: #fef0f0; border: 1px solid #fbc4c4; }
+.alert-card.expired .alert-num { color: #f56c6c; }
+.alert-card.warning { background: #fdf6ec; border: 1px solid #f5dab1; }
+.alert-card.warning .alert-num { color: #e6a23c; }
+
+.el-table .row-expired { background-color: #fff5f5 !important; }
+.el-table .row-warning { background-color: #fffaeb !important; }
+
+.batch-alert-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 6px; margin-bottom: 8px; cursor: pointer; border: 1px solid #ebeef5; }
+.batch-alert-row.expired { background: #fef0f0; border-color: #fbc4c4; }
+.batch-alert-row.warning { background: #fdf6ec; border-color: #f5dab1; }
+.batch-alert-row:hover { box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+
+.take-expired .el-input__wrapper { box-shadow: 0 0 0 1px #f56c6c inset !important; }

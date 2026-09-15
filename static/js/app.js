@@ -25,6 +25,40 @@ const STAGES = [
     { key: 'binding',  label: '装订', status: 'binding_status',  progress: 'binding_progress',  note: 'binding_note' },
 ];
 const PAPER_TYPES = { coated: '铜版纸', offset: '胶版纸', whiteboard: '白卡纸', kraft: '牛皮纸', special: '特种纸' };
+const BATCH_STATE = {
+    expired: { label: '已过期', type: 'danger' },
+    warning: { label: '临期', type: 'warning' },
+    normal: { label: '正常', type: 'success' },
+    none: { label: '无保质期', type: 'info' },
+};
+// 距到期 ≤ 该天数视为临期（与后端 BATCH_WARNING_DAYS 保持一致）
+const BATCH_WARNING_DAYS = 30;
+function addDate(days) {
+    const d = new Date();
+    d.setDate(d.getDate() + Number(days || 0));
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function batchState(b) {
+    if (!b.expiry_date) return 'none';
+    return b.days_to_expiry < 0 ? 'expired' : (b.days_to_expiry <= BATCH_WARNING_DAYS ? 'warning' : 'normal');
+}
+function expiryText(b) {
+    if (!b.expiry_date) return '无保质期';
+    const d = b.days_to_expiry;
+    if (d < 0) return `${b.expiry_date}（已过期 ${-d} 天）`;
+    if (d === 0) return `${b.expiry_date}（今日到期）`;
+    return `${b.expiry_date}（剩 ${d} 天）`;
+}
+// FEFO 排序：到期日早的在前，无保质期排最后
+function fefoSort(list) {
+    return [...list].sort((a, b) => {
+        if (!a.expiry_date && b.expiry_date) return 1;
+        if (a.expiry_date && !b.expiry_date) return -1;
+        if (a.expiry_date !== b.expiry_date) return a.expiry_date < b.expiry_date ? -1 : 1;
+        if (a.arrival_date !== b.arrival_date) return a.arrival_date < b.arrival_date ? -1 : 1;
+        return a.id - b.id;
+    });
+}
 const MACHINE_STATUS = { running: { label: '生产中', type: 'success' }, idle: { label: '空闲', type: 'info' }, maintenance: { label: '维保中', type: 'warning' } };
 const REWORK_STATUS = { open: { label: '待处理', type: 'danger' }, processing: { label: '返工中', type: 'warning' }, closed: { label: '已闭环', type: 'success' } };
 const REWORK_REASONS = { color: '色差', register: '套印不准', scratch: '划伤/脏点', binding: '装订错误', material: '材料问题', other: '其他' };
@@ -156,6 +190,37 @@ const Dashboard = {
 
           <div class="panel">
             <div class="panel-title">
+              纸张批次效期预警
+              <el-button link type="primary" size="small" @click="$emit('go', 'papers')">去处理 →</el-button>
+            </div>
+            <el-radio-group v-model="batchTab" size="small" style="margin-bottom:8px">
+              <el-radio-button label="expired">已过期 ({{ data.expired_batches.length }})</el-radio-button>
+              <el-radio-button label="warning">临期 ≤{{ data.batch_warning_days || 30 }}天 ({{ data.expiring_batches.length }})</el-radio-button>
+            </el-radio-group>
+            <div v-if="!batchAlertList.length" class="muted">没有{{ batchTab==='expired' ? '过期' : '临期' }}批次，纸张效期健康 ✅</div>
+            <div v-for="b in batchAlertList" :key="b.id" class="batch-alert-row"
+                 :class="b.state" @click="$emit('go', 'papers')">
+              <div>
+                <el-tag :type="b.state==='expired' ? 'danger' : 'warning'" size="small" effect="dark" style="margin-right:6px">
+                  {{ b.state==='expired' ? '已过期' : '临期' }}
+                </el-tag>
+                <strong>{{ b.paper_name }}</strong>
+                <span class="muted"> · {{ b.spec }}</span>
+                <div class="muted" style="font-size:12px;margin-top:2px">
+                  批次 {{ b.batch_no }} · 到货 {{ b.arrival_date }} · 保质期至 {{ b.expiry_date }}
+                </div>
+              </div>
+              <div style="text-align:right;white-space:nowrap">
+                <div :style="{color:b.state==='expired'?'#f56c6c':'#e6a23c',fontWeight:700}">{{ formatNum(b.remaining) }} 张</div>
+                <div class="muted" style="font-size:12px">
+                  {{ b.days_to_expiry < 0 ? '已过 '+(-b.days_to_expiry)+' 天' : '剩 '+b.days_to_expiry+' 天' }}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-title">
               纸张低库存
               <el-button link type="primary" size="small" @click="$emit('go', 'papers')">去处理 →</el-button>
             </div>
@@ -178,9 +243,11 @@ const Dashboard = {
     setup(_, { emit }) {
         const loading = ref(false);
         const warnTab = ref('overdue');
+        const batchTab = ref('expired');
         const data = reactive({
             summary: {}, status_counts: {}, overdue_orders: [], urgent_orders: [],
             warning_orders: [], low_papers: [], stage_stats: {}, weekly_load: [],
+            expired_batches: [], expiring_batches: [], batch_warning_days: 30,
         });
         const machines = ref([]);
 
@@ -194,6 +261,9 @@ const Dashboard = {
         const warnList = computed(() => ({
             overdue: data.overdue_orders, urgent: data.urgent_orders, warning: data.warning_orders,
         }[warnTab.value]));
+
+        const batchAlertList = computed(() =>
+            batchTab.value === 'expired' ? data.expired_batches : data.expiring_batches);
 
         const maxLoad = computed(() => Math.max(1, ...data.weekly_load.map(d => d.planned_qty)));
         const barHeight = (v) => Math.round(v / maxLoad.value * 100);
@@ -214,11 +284,15 @@ const Dashboard = {
                     if (data.urgent_orders.length) warnTab.value = 'urgent';
                     else if (data.warning_orders.length) warnTab.value = 'warning';
                 }
+                if (!data.expired_batches.length && data.expiring_batches.length) {
+                    batchTab.value = 'warning';
+                }
             } catch (e) { ElMessage.error(e.message); } finally { loading.value = false; }
         });
 
         return {
-            loading, warnTab, data, machines, cards, warnList, ORDER_STATUS, MACHINE_STATUS,
+            loading, warnTab, batchTab, data, machines, cards, warnList, batchAlertList,
+            ORDER_STATUS, MACHINE_STATUS,
             barHeight, daysText, daysClass, formatNum, go, openOrder,
         };
     },
@@ -761,17 +835,76 @@ const Orders = {
 window.__APP_COMPONENTS__.Orders = Orders;
 
 /* ============================================================
- * 视图三：纸张材料（库存 + 出入库流水）
+ * 视图三：纸张材料（批次库存 + FEFO 出入库流水）
  * ============================================================ */
 const Papers = {
     template: `
     <div v-loading="loading">
+      <!-- 效期预警横幅 -->
+      <el-row :gutter="16" style="margin-bottom:16px">
+        <el-col :span="12">
+          <div class="alert-card expired" @click="expandRows(expiredPapers)">
+            <div class="alert-icon">⛔</div>
+            <div>
+              <div class="alert-num">{{ expiredBatches.length }}</div>
+              <div class="alert-label">个批次已过期（合计 {{ formatNum(expiredSheets) }} 张），禁止领用，请尽快处理</div>
+            </div>
+          </div>
+        </el-col>
+        <el-col :span="12">
+          <div class="alert-card warning" @click="expandRows(warningPapers)">
+            <div class="alert-icon">⏰</div>
+            <div>
+              <div class="alert-num">{{ warningBatches.length }}</div>
+              <div class="alert-label">个批次 {{ BATCH_WARNING_DAYS }} 天内到期（合计 {{ formatNum(warningSheets) }} 张），请优先使用</div>
+            </div>
+          </div>
+        </el-col>
+      </el-row>
+
       <div class="panel">
         <div class="panel-title">
-          纸张库存
-          <el-button type="primary" size="small" @click="openEdit(null)">+ 新增纸张</el-button>
+          纸张库存（点击行首 ▶ 查看各批次余量）
+          <el-radio-group v-model="batchFilter" size="small" style="margin-left:16px">
+            <el-radio-button label="">全部</el-radio-button>
+            <el-radio-button label="expired">已过期</el-radio-button>
+            <el-radio-button label="warning">临期</el-radio-button>
+          </el-radio-group>
+          <el-button type="primary" size="small" style="float:right" @click="openEdit(null)">+ 新增纸张</el-button>
         </div>
-        <el-table :data="papers" border stripe>
+        <el-table ref="stockTable" :data="filteredPapers" border stripe row-key="id"
+                  :expand-row-keys="expandedKeys" @expand-change="onExpand" :row-class-name="paperRowClass">
+          <el-table-column type="expand">
+            <template #default="{ row }">
+              <div style="padding:8px 24px;background:#fafbfc">
+                <div style="font-weight:600;margin-bottom:8px">
+                  {{ row.name }} {{ row.spec }} — 各批次余量（按先到期先出排序）
+                </div>
+                <el-table :data="fefoSort(row.batches)" size="small" border empty-text="暂无批次，请先做批次入库">
+                  <el-table-column prop="batch_no" label="批次号" width="170"></el-table-column>
+                  <el-table-column prop="arrival_date" label="到货日期" width="120"></el-table-column>
+                  <el-table-column label="保质期 / 剩余天数" min-width="230">
+                    <template #default="{ row: b }">
+                      <el-tag :type="BATCH_STATE[b.expiry_state].type" size="small" effect="dark" style="margin-right:8px">
+                        {{ BATCH_STATE[b.expiry_state].label }}
+                      </el-tag>
+                      {{ expiryText(b) }}
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="剩余(张)" width="120">
+                    <template #default="{ row: b }">
+                      <span :style="{fontWeight:700, color:b.expiry_state==='expired'?'#f56c6c':b.expiry_state==='warning'?'#e6a23c':'#303133'}">
+                        {{ formatNum(b.remaining) }}
+                      </span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column prop="note" label="备注" min-width="120">
+                    <template #default="{ row: b }">{{ b.note || '—' }}</template>
+                  </el-table-column>
+                </el-table>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column prop="name" label="纸张名称" width="150"></el-table-column>
           <el-table-column label="类型" width="100">
             <template #default="{ row }">
@@ -779,7 +912,7 @@ const Papers = {
             </template>
           </el-table-column>
           <el-table-column prop="spec" label="规格(克重/尺寸)" min-width="160"></el-table-column>
-          <el-table-column label="库存(张)" width="140">
+          <el-table-column label="库存(张)" width="150">
             <template #default="{ row }">
               <span :style="{ color: row.is_low ? '#f56c6c' : '#303133', fontWeight: row.is_low ? 700 : 600 }">
                 {{ formatNum(row.stock) }}
@@ -787,13 +920,24 @@ const Papers = {
               <el-tag v-if="row.is_low" type="danger" size="small" effect="dark" style="margin-left:6px">低库存</el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="safety_stock" label="安全库存" width="110">
+          <el-table-column label="效期预警" width="150">
+            <template #default="{ row }">
+              <el-tag v-if="row.expired_batch_count" type="danger" size="small" effect="dark" style="margin-right:4px">
+                ⛔ 过期 {{ row.expired_batch_count }} 批
+              </el-tag>
+              <el-tag v-if="row.warning_batch_count" type="warning" size="small" effect="dark">
+                ⏰ 临期 {{ row.warning_batch_count }} 批
+              </el-tag>
+              <span v-if="!row.expired_batch_count && !row.warning_batch_count" class="muted">正常</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="safety_stock" label="安全库存" width="100">
             <template #default="{ row }">{{ formatNum(row.safety_stock) }}</template>
           </el-table-column>
-          <el-table-column label="单价(元/张)" width="120">
+          <el-table-column label="单价(元/张)" width="110">
             <template #default="{ row }">{{ Number(row.unit_price).toFixed(4) }}</template>
           </el-table-column>
-          <el-table-column label="库存金额(元)" width="130">
+          <el-table-column label="库存金额(元)" width="120">
             <template #default="{ row }">{{ formatNum(Math.round(row.stock * row.unit_price)) }}</template>
           </el-table-column>
           <el-table-column label="操作" width="230" fixed="right">
@@ -807,23 +951,30 @@ const Papers = {
       </div>
 
       <div class="panel">
-        <div class="panel-title">出入库流水</div>
+        <div class="panel-title">出入库流水（含批次去向）</div>
         <el-table :data="txs" border size="small" max-height="420">
-          <el-table-column prop="tx_date" label="日期" width="120"></el-table-column>
+          <el-table-column prop="tx_date" label="日期" width="110"></el-table-column>
           <el-table-column label="类型" width="80">
             <template #default="{ row }">
               <el-tag :type="row.tx_type==='in' ? 'success' : 'warning'" size="small">{{ row.tx_type_display }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="paper_name" label="纸张" min-width="180"></el-table-column>
-          <el-table-column label="数量(张)" width="120">
+          <el-table-column prop="paper_name" label="纸张" min-width="150"></el-table-column>
+          <el-table-column label="批次 / 保质期" min-width="220">
+            <template #default="{ row }">
+              <span v-if="row.batch_no" style="font-weight:600">{{ row.batch_no }}</span>
+              <span v-else class="muted">—</span>
+              <div class="muted" style="font-size:12px">{{ row.expiry_date || '' }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="数量(张)" width="110">
             <template #default="{ row }">
               <span :style="{ color: row.tx_type==='in' ? '#67c23a' : '#e6a23c', fontWeight: 600 }">
                 {{ row.tx_type === 'in' ? '+' : '-' }}{{ formatNum(row.quantity) }}
               </span>
             </template>
           </el-table-column>
-          <el-table-column prop="order_no" label="关联订单" width="160">
+          <el-table-column prop="order_no" label="关联订单" width="150">
             <template #default="{ row }">{{ row.order_no || '—' }}</template>
           </el-table-column>
           <el-table-column prop="note" label="备注" min-width="160"></el-table-column>
@@ -855,7 +1006,8 @@ const Papers = {
           <el-form-item label="单价(元/张)">
             <el-input-number v-model="form.unit_price" :min="0" :step="0.05" :precision="4" style="width:100%"></el-input-number>
           </el-form-item>
-          <div v-if="editing" class="muted" style="padding-left:110px">库存数量请通过入库/出库操作变更，以保证流水完整</div>
+          <div v-if="editing" class="muted" style="padding-left:110px">库存数量请通过入库/出库操作变更，以保证批次与流水完整</div>
+          <div v-else class="muted" style="padding-left:110px">新建时的期初库存将自动记入“期初批次”，到货后请用“入库”按批次登记保质期</div>
         </el-form>
         <template #footer>
           <el-button @click="formVisible=false">取消</el-button>
@@ -863,27 +1015,115 @@ const Papers = {
         </template>
       </el-dialog>
 
-      <!-- 入/出库 -->
-      <el-dialog v-model="stockVisible" :title="(stockType==='in'?'纸张入库':'纸张出库') + ' — ' + (stockRow?.name||'')" width="440px">
-        <el-form :model="stockForm" label-width="90px">
-          <el-form-item label="当前库存">
-            <span style="font-weight:600">{{ stockRow ? formatNum(stockRow.stock) : '' }} 张</span>
+      <!-- 批次入库 -->
+      <el-dialog v-model="stockVisible" title="纸张批次入库" width="500px">
+        <el-form :model="stockForm" label-width="100px" v-if="stockRow">
+          <el-form-item label="纸张">
+            <span style="font-weight:600">{{ stockRow.name }} {{ stockRow.spec }}</span>
+            <span class="muted" style="margin-left:8px">当前库存 {{ formatNum(stockRow.stock) }} 张</span>
           </el-form-item>
-          <el-form-item :label="stockType==='in' ? '入库数量' : '出库数量'" required>
-            <el-input-number v-model="stockForm.quantity" :min="1" :step="500" style="width:100%"></el-input-number>
+          <el-form-item label="批次号" required>
+            <el-input v-model="stockForm.batch_no" placeholder="如 B20260915-01 / 供应商批号"></el-input>
           </el-form-item>
-          <el-form-item v-if="stockType==='out'" label="关联订单">
+          <el-row :gutter="12">
+            <el-col :span="12">
+              <el-form-item label="到货日期" required>
+                <el-date-picker v-model="stockForm.arrival_date" type="date" value-format="YYYY-MM-DD" style="width:100%"></el-date-picker>
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="入库数量" required>
+                <el-input-number v-model="stockForm.quantity" :min="1" :step="500" style="width:100%"></el-input-number>
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <el-form-item label="保质期" required>
+            <el-radio-group v-model="stockForm.expiryMode" size="small">
+              <el-radio-button label="days">按天数</el-radio-button>
+              <el-radio-button label="date">指定到期日</el-radio-button>
+              <el-radio-button label="none">无保质期</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item v-if="stockForm.expiryMode==='days'" label="保质期天数">
+            <el-input-number v-model="stockForm.shelf_life_days" :min="1" :step="30" style="width:100%"></el-input-number>
+            <div class="muted" style="font-size:12px">预计到期日：{{ stockForm.arrival_date && stockForm.shelf_life_days ? addDateOffset(stockForm.arrival_date, stockForm.shelf_life_days) : '—' }}</div>
+          </el-form-item>
+          <el-form-item v-if="stockForm.expiryMode==='date'" label="到期日">
+            <el-date-picker v-model="stockForm.expiry_date" type="date" value-format="YYYY-MM-DD" style="width:100%"></el-date-picker>
+          </el-form-item>
+          <el-form-item label="备注">
+            <el-input v-model="stockForm.note" placeholder="采购入库 / 供应商 / 存放库位"></el-input>
+          </el-form-item>
+          <el-alert type="info" :closable="false" style="margin-top:4px"
+                    title="同一批次号再次到货会自动累加到该批次；新批次号则建立新的批次档案"></el-alert>
+        </el-form>
+        <template #footer>
+          <el-button @click="stockVisible=false">取消</el-button>
+          <el-button type="success" @click="doStockIn">确认入库</el-button>
+        </template>
+      </el-dialog>
+
+      <!-- FEFO 出库 -->
+      <el-dialog v-model="stockVisibleOut" title="纸张出库（先到期先出 FEFO）" width="640px">
+        <el-form :model="stockForm" label-width="92px" v-if="stockRow">
+          <el-form-item label="纸张">
+            <span style="font-weight:600">{{ stockRow.name }} {{ stockRow.spec }}</span>
+            <span class="muted" style="margin-left:8px">可用库存 {{ formatNum(stockRow.stock) }} 张</span>
+          </el-form-item>
+          <el-form-item label="出库数量" required>
+            <el-input-number v-model="stockForm.quantity" :min="1" :step="500" style="width:100%"
+                             @change="buildFefoPlan"></el-input-number>
+          </el-form-item>
+          <el-form-item label="关联订单">
             <el-select v-model="stockForm.order" clearable filterable placeholder="可选" style="width:100%">
               <el-option v-for="o in activeOrders" :key="o.id" :label="o.order_no + ' ' + o.product_name" :value="o.id"></el-option>
             </el-select>
           </el-form-item>
+          <el-form-item label="批次分配">
+            <div style="width:100%">
+              <div style="margin-bottom:6px">
+                <el-button size="small" @click="buildFefoPlan">↻ 按 FEFO 重算</el-button>
+                <span class="muted" style="margin-left:8px;font-size:12px">可手动调整各批次出库张数，合计需等于出库数量</span>
+              </div>
+              <el-table :data="allocRows" size="small" border max-height="260">
+                <el-table-column prop="batch_no" label="批次号" width="150"></el-table-column>
+                <el-table-column label="保质期" min-width="180">
+                  <template #default="{ row }">
+                    <el-tag :type="BATCH_STATE[batchState(row)].type" size="small" effect="dark" style="margin-right:6px">
+                      {{ BATCH_STATE[batchState(row)].label }}
+                    </el-tag>
+                    <span class="muted">{{ row.expiry_date || '无保质期' }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="剩余(张)" width="90">
+                  <template #default="{ row }">{{ formatNum(row.remaining) }}</template>
+                </el-table-column>
+                <el-table-column label="本批出库" width="130">
+                  <template #default="{ row }">
+                    <el-input-number v-model="row.take" :min="0" :max="row.remaining" :step="100"
+                                     size="small" controls-position="right" style="width:120px"
+                                     :class="{ 'take-expired': batchState(row)==='expired' && row.take>0 }"></el-input-number>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <div style="margin-top:8px;display:flex;gap:16px">
+                <span>已分配：<strong :style="{color:allocTotal===stockForm.quantity?'#67c23a':'#f56c6c'}">{{ formatNum(allocTotal) }}</strong></span>
+                <span>需出库：<strong>{{ formatNum(stockForm.quantity) }}</strong></span>
+                <span v-if="allocTotal!==stockForm.quantity" style="color:#f56c6c">
+                  {{ allocTotal < stockForm.quantity ? '还差 ' + formatNum(stockForm.quantity-allocTotal) + ' 张未分配' : '超出 ' + formatNum(allocTotal-stockForm.quantity) + ' 张' }}
+                </span>
+              </div>
+              <el-alert v-if="allocHasExpired" type="error" :closable="false" style="margin-top:8px"
+                        title="本次出库包含已过期批次！请确认纸张仍可使用，否则请把该批次出库数改为 0 并重新分配"></el-alert>
+            </div>
+          </el-form-item>
           <el-form-item label="备注">
-            <el-input v-model="stockForm.note" :placeholder="stockType==='in' ? '采购入库' : '生产领料'"></el-input>
+            <el-input v-model="stockForm.note" placeholder="生产领料"></el-input>
           </el-form-item>
         </el-form>
         <template #footer>
-          <el-button @click="stockVisible=false">取消</el-button>
-          <el-button :type="stockType==='in' ? 'success' : 'warning'" @click="doStock">确认</el-button>
+          <el-button @click="stockVisibleOut=false">取消</el-button>
+          <el-button type="warning" :disabled="allocTotal!==stockForm.quantity || !stockForm.quantity" @click="doStockOut">确认出库</el-button>
         </template>
       </el-dialog>
     </div>`,
@@ -893,17 +1133,64 @@ const Papers = {
         const papers = ref([]);
         const txs = ref([]);
         const activeOrders = ref([]);
+        const batchFilter = ref('');
+        const expandedKeys = ref([]);
+        const stockTable = ref(null);
 
         const formVisible = ref(false);
         const editing = ref(null);
         const form = reactive({ name: '', paper_type: 'coated', spec: '', stock: 0, safety_stock: 0, unit_price: 0.1 });
 
         const stockVisible = ref(false);
-        const stockType = ref('in');
+        const stockVisibleOut = ref(false);
         const stockRow = ref(null);
-        const stockForm = reactive({ quantity: 500, order: null, note: '' });
+        const stockForm = reactive({
+            quantity: 500, order: null, note: '',
+            batch_no: '', arrival_date: todayStr(), expiryMode: 'days',
+            shelf_life_days: 365, expiry_date: '',
+        });
+        const allocRows = ref([]);
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
+        function addDateOffset(dateStr, days) {
+            const d = new Date(dateStr + 'T00:00:00');
+            d.setDate(d.getDate() + Number(days));
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        }
+
+        const activeBatches = computed(() =>
+            papers.value.flatMap(p => p.batches.map(b => ({ ...b, paper_id: p.id, paper_name: p.name, spec: p.spec })))
+        );
+        const expiredBatches = computed(() => activeBatches.value.filter(b => b.expiry_state === 'expired'));
+        const warningBatches = computed(() => activeBatches.value.filter(b => b.expiry_state === 'warning'));
+        const expiredSheets = computed(() => expiredBatches.value.reduce((a, b) => a + b.remaining, 0));
+        const warningSheets = computed(() => warningBatches.value.reduce((a, b) => a + b.remaining, 0));
+        const expiredPapers = computed(() => [...new Set(expiredBatches.value.map(b => b.paper_id))]);
+        const warningPapers = computed(() => [...new Set(warningBatches.value.map(b => b.paper_id))]);
+
+        const filteredPapers = computed(() => {
+            if (!batchFilter.value) return papers.value;
+            return papers.value.filter(p =>
+                p.batches.some(b => b.remaining > 0 && b.expiry_state === batchFilter.value));
+        });
+
+        function expandRows(ids) {
+            batchFilter.value = '';
+            expandedKeys.value = [...ids];
+        }
+        function onExpand(row, expanded) {
+            // 与 :expand-row-keys 受控模式同步
+            const id = row.id;
+            const isOpen = Array.isArray(expanded) ? expanded.some(r => r.id === id) : expanded;
+            const set = new Set(expandedKeys.value);
+            isOpen ? set.add(id) : set.delete(id);
+            expandedKeys.value = [...set];
+        }
+        function paperRowClass({ row }) {
+            if (row.expired_batch_count) return 'row-expired';
+            if (row.warning_batch_count) return 'row-warning';
+            return '';
+        }
 
         async function load() {
             loading.value = true;
@@ -941,16 +1228,69 @@ const Papers = {
 
         function openStock(row, type) {
             stockRow.value = row;
-            stockType.value = type;
-            Object.assign(stockForm, { quantity: 500, order: null, note: '' });
-            stockVisible.value = true;
+            Object.assign(stockForm, {
+                quantity: 500, order: null, note: '',
+                batch_no: 'B' + todayStr().replaceAll('-', '') + '-01',
+                arrival_date: todayStr(), expiryMode: 'days',
+                shelf_life_days: 365, expiry_date: '',
+            });
+            if (type === 'in') {
+                stockVisible.value = true;
+            } else {
+                allocRows.value = [];
+                stockVisibleOut.value = true;
+                buildFefoPlan();
+            }
         }
-        async function doStock() {
+
+        async function doStockIn() {
+            if (!stockForm.batch_no) { ElMessage.warning('请填写批次号'); return; }
+            if (!stockForm.arrival_date) { ElMessage.warning('请选择到货日期'); return; }
+            const payload = {
+                quantity: stockForm.quantity,
+                batch_no: stockForm.batch_no,
+                arrival_date: stockForm.arrival_date,
+                note: stockForm.note,
+            };
+            if (stockForm.expiryMode === 'days') payload.shelf_life_days = stockForm.shelf_life_days;
+            if (stockForm.expiryMode === 'date') payload.expiry_date = stockForm.expiry_date;
             try {
-                const url = `/papers/${stockRow.value.id}/${stockType.value === 'in' ? 'stock_in' : 'stock_out'}/`;
-                await apiPost(url, { quantity: stockForm.quantity, order: stockForm.order, note: stockForm.note });
-                ElMessage.success(stockType.value === 'in' ? '入库成功' : '出库成功');
+                const res = await apiPost(`/papers/${stockRow.value.id}/stock_in/`, payload);
+                ElMessage.success(res.message || '入库成功');
                 stockVisible.value = false;
+                load();
+                emit('refresh-dashboard');
+            } catch (e) { ElMessage.error(e.message); }
+        }
+
+        const allocTotal = computed(() => allocRows.value.reduce((a, r) => a + Number(r.take || 0), 0));
+        const allocHasExpired = computed(() =>
+            allocRows.value.some(r => r.take > 0 && batchState(r) === 'expired'));
+
+        async function buildFefoPlan() {
+            if (!stockRow.value || !stockForm.quantity) { allocRows.value = []; return; }
+            try {
+                const res = await apiGet(`/papers/${stockRow.value.id}/fefo_plan/?quantity=${stockForm.quantity}`);
+                allocRows.value = (res.plan || []).map(r => ({ ...r, take: r.take }));
+            } catch (e) {
+                ElMessage.error(e.message);
+            }
+        }
+
+        async function doStockOut() {
+            const allocations = allocRows.value
+                .filter(r => r.take > 0)
+                .map(r => ({ batch: r.id || r.batch_id, quantity: Number(r.take) }));
+            try {
+                const res = await apiPost(`/papers/${stockRow.value.id}/stock_out/`, {
+                    quantity: stockForm.quantity,
+                    order: stockForm.order,
+                    note: stockForm.note,
+                    allocations,
+                });
+                if (res.used_expired) ElMessage.warning(res.message);
+                else ElMessage.success(res.message || '出库成功');
+                stockVisibleOut.value = false;
                 load();
                 emit('refresh-dashboard');
             } catch (e) { ElMessage.error(e.message); }
@@ -958,9 +1298,16 @@ const Papers = {
 
         onMounted(load);
         return {
-            loading, papers, txs, activeOrders, PAPER_TYPES,
-            formVisible, editing, form, stockVisible, stockType, stockRow, stockForm,
-            formatNum, openEdit, save, openStock, doStock,
+            loading, papers, txs, activeOrders, PAPER_TYPES, BATCH_STATE, BATCH_WARNING_DAYS,
+            batchFilter, expandedKeys, stockTable,
+            expiredBatches, warningBatches, expiredSheets, warningSheets,
+            expiredPapers, warningPapers, filteredPapers,
+            formVisible, editing, form,
+            stockVisible, stockVisibleOut, stockRow, stockForm, allocRows,
+            formatNum, addDateOffset, fefoSort, expiryText, batchState,
+            expandRows, onExpand, paperRowClass,
+            openEdit, save, openStock, doStockIn,
+            allocTotal, allocHasExpired, buildFefoPlan, doStockOut,
         };
     },
 };

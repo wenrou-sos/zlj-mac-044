@@ -3,6 +3,9 @@ from datetime import date
 from django.db import models
 from django.utils import timezone
 
+# 距保质期不足该天数视为“临期”
+BATCH_WARNING_DAYS = 30
+
 
 def today():
     """当前本地日期（兼容 USE_TZ=False）"""
@@ -51,6 +54,61 @@ class Paper(models.Model):
     @property
     def is_low(self):
         return self.stock <= self.safety_stock
+
+
+class PaperBatch(models.Model):
+    """纸张批次：每批到货登记批次号、到货日期与保质期"""
+
+    paper = models.ForeignKey(Paper, verbose_name='纸张', on_delete=models.CASCADE, related_name='batches')
+    batch_no = models.CharField('批次号', max_length=50)
+    arrival_date = models.DateField('到货日期', default=today)
+    expiry_date = models.DateField('保质期至', null=True, blank=True)
+    note = models.CharField('备注', max_length=200, blank=True)
+
+    class Meta:
+        verbose_name = '纸张批次'
+        verbose_name_plural = verbose_name
+        unique_together = ('paper', 'batch_no')
+        ordering = ['arrival_date', 'id']
+
+    def __str__(self):
+        return f'{self.paper} [{self.batch_no}]'
+
+    @property
+    def remaining(self):
+        """该批次当前剩余张数 = 入库合计 - 出库合计
+
+        查询集若已 prefetch_related('transactions')，则直接在内存中汇总，避免 N+1 聚合。
+        """
+        cache = getattr(self, '_prefetched_objects_cache', {})
+        if 'transactions' in cache:
+            txs = cache['transactions']
+            return sum(t.quantity if t.tx_type == PaperTransaction.TxType.IN else -t.quantity
+                       for t in txs)
+        agg = self.transactions.aggregate(
+            in_qty=models.Sum('quantity', filter=models.Q(tx_type=PaperTransaction.TxType.IN)),
+            out_qty=models.Sum('quantity', filter=models.Q(tx_type=PaperTransaction.TxType.OUT)),
+        )
+        return (agg['in_qty'] or 0) - (agg['out_qty'] or 0)
+
+    @property
+    def days_to_expiry(self):
+        """距保质期天数；未登记保质期返回 None"""
+        if not self.expiry_date:
+            return None
+        return (self.expiry_date - today()).days
+
+    @property
+    def expiry_state(self):
+        """效期状态：expired 已过期 / warning 临期 / normal 正常 / none 无保质期"""
+        days = self.days_to_expiry
+        if days is None:
+            return 'none'
+        if days < 0:
+            return 'expired'
+        if days <= BATCH_WARNING_DAYS:
+            return 'warning'
+        return 'normal'
 
 
 class Machine(models.Model):
@@ -249,6 +307,8 @@ class PaperTransaction(models.Model):
         OUT = 'out', '出库'
 
     paper = models.ForeignKey(Paper, verbose_name='纸张', on_delete=models.CASCADE, related_name='transactions')
+    batch = models.ForeignKey(PaperBatch, verbose_name='批次', on_delete=models.SET_NULL,
+                              null=True, blank=True, related_name='transactions')
     tx_type = models.CharField('类型', max_length=10, choices=TxType.choices)
     quantity = models.PositiveIntegerField('数量(张)')
     order = models.ForeignKey(Order, verbose_name='关联订单', on_delete=models.SET_NULL, null=True, blank=True)

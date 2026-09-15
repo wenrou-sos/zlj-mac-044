@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from rest_framework import serializers
 
 from .models import (
@@ -6,6 +8,7 @@ from .models import (
     Machine,
     Order,
     Paper,
+    PaperBatch,
     PaperTransaction,
     ProcessProgress,
     ReworkRecord,
@@ -19,13 +22,50 @@ class CustomerSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+class PaperBatchSerializer(serializers.ModelSerializer):
+    remaining = serializers.IntegerField(read_only=True)
+    days_to_expiry = serializers.IntegerField(read_only=True)
+    expiry_state = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = PaperBatch
+        fields = ['id', 'paper', 'batch_no', 'arrival_date', 'expiry_date',
+                  'note', 'remaining', 'days_to_expiry', 'expiry_state']
+        read_only_fields = ['paper']
+
+
 class PaperSerializer(serializers.ModelSerializer):
     paper_type_display = serializers.CharField(source='get_paper_type_display', read_only=True)
     is_low = serializers.BooleanField(read_only=True)
+    batches = serializers.SerializerMethodField()
+    expired_batch_count = serializers.SerializerMethodField()
+    warning_batch_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Paper
         fields = '__all__'
+
+    def _active_batches(self, obj):
+        """仍有剩余的批次，FEFO 排序（带缓存，供多个字段复用）"""
+        cache = self.context.setdefault('_paper_batch_cache', {})
+        if obj.pk not in cache:
+            rows = [b for b in obj.batches.all() if b.remaining > 0]
+            rows.sort(key=lambda b: (
+                b.expiry_date is None,
+                b.expiry_date or _today() + timedelta(days=99999),
+                b.arrival_date, b.id,
+            ))
+            cache[obj.pk] = rows
+        return cache[obj.pk]
+
+    def get_batches(self, obj):
+        return PaperBatchSerializer(self._active_batches(obj), many=True).data
+
+    def get_expired_batch_count(self, obj):
+        return sum(1 for b in self._active_batches(obj) if b.expiry_state == 'expired')
+
+    def get_warning_batch_count(self, obj):
+        return sum(1 for b in self._active_batches(obj) if b.expiry_state == 'warning')
 
 
 class MachineSerializer(serializers.ModelSerializer):
@@ -239,6 +279,8 @@ class PaperTransactionSerializer(serializers.ModelSerializer):
     paper_name = serializers.CharField(source='paper.name', read_only=True)
     tx_type_display = serializers.CharField(source='get_tx_type_display', read_only=True)
     order_no = serializers.CharField(source='order.order_no', read_only=True, allow_null=True)
+    batch_no = serializers.CharField(source='batch.batch_no', read_only=True, allow_null=True)
+    expiry_date = serializers.DateField(source='batch.expiry_date', read_only=True, allow_null=True)
 
     class Meta:
         model = PaperTransaction

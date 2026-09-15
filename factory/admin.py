@@ -5,6 +5,7 @@ from .models import (
     Machine,
     Order,
     Paper,
+    PaperBatch,
     PaperTransaction,
     ProcessProgress,
     ReworkRecord,
@@ -23,6 +24,18 @@ class PaperAdmin(admin.ModelAdmin):
     list_display = ('name', 'paper_type', 'spec', 'stock', 'safety_stock', 'unit_price')
     list_filter = ('paper_type',)
     search_fields = ('name', 'spec')
+
+
+@admin.register(PaperBatch)
+class PaperBatchAdmin(admin.ModelAdmin):
+    list_display = ('batch_no', 'paper', 'remaining_display', 'arrival_date', 'expiry_date', 'note')
+    list_filter = ('arrival_date', 'expiry_date')
+    search_fields = ('batch_no', 'paper__name', 'paper__spec')
+    autocomplete_fields = ('paper',)
+
+    @admin.display(description='剩余张数')
+    def remaining_display(self, obj):
+        return obj.remaining
 
 
 @admin.register(Machine)
@@ -58,5 +71,6 @@ class ReworkRecordAdmin(admin.ModelAdmin):
 
 @admin.register(PaperTransaction)
 class PaperTransactionAdmin(admin.ModelAdmin):
-    list_display = ('tx_date', 'paper', 'tx_type', 'quantity', 'order')
+    list_display = ('tx_date', 'paper', 'batch', 'tx_type', 'quantity', 'order')
     list_filter = ('tx_type', 'tx_date')
+    autocomplete_fields = ('paper', 'batch')
