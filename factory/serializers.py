@@ -141,12 +141,14 @@ class OrderListSerializer(serializers.ModelSerializer):
         return f'{obj.paper.name} {obj.paper.spec}'
 
     def get_received_qty(self, obj):
-        """已领料张数：优先取视图注解值，未注解时实时汇总出库流水"""
+        """已领料张数：只统计纸张与订单用纸一致的出库流水；
+        优先取视图注解值，未注解时实时汇总"""
         annotated = getattr(obj, 'received_qty_annotated', None)
         if annotated is not None:
             return annotated
         return (PaperTransaction.objects
-                .filter(order=obj, tx_type=PaperTransaction.TxType.OUT)
+                .filter(order=obj, paper_id=obj.paper_id,
+                        tx_type=PaperTransaction.TxType.OUT)
                 .aggregate(s=Sum('quantity'))['s'] or 0)
 
     def get_remaining_qty(self, obj):
@@ -194,8 +196,9 @@ class OrderSerializer(OrderListSerializer):
         return ReworkSerializer(obj.reworks.all(), many=True).data
 
     def get_paper_transactions(self, obj):
-        """该订单的领料流水（出库记录），用于详情页核对每次领料"""
-        qs = (PaperTransaction.objects.filter(order=obj)
+        """该订单用纸的领料流水（出库记录），与已领口径一致，用于详情页核对"""
+        qs = (PaperTransaction.objects
+              .filter(order=obj, paper_id=obj.paper_id)
               .select_related('paper', 'order').order_by('-tx_date', '-id'))
         return PaperTransactionSerializer(qs, many=True).data
 

@@ -1007,8 +1007,9 @@ const Papers = {
             <el-input-number v-model="stockForm.quantity" :min="1" :step="500" style="width:100%"></el-input-number>
           </el-form-item>
           <el-form-item v-if="stockType==='out'" label="关联订单">
-            <el-select v-model="stockForm.order" clearable filterable placeholder="可选" style="width:100%">
-              <el-option v-for="o in activeOrders" :key="o.id" :label="o.order_no + ' ' + o.product_name" :value="o.id"></el-option>
+            <el-select v-model="stockForm.order" clearable filterable placeholder="可选（仅列出使用该纸张的订单）" style="width:100%">
+              <el-option v-for="o in orderOptions" :key="o.id"
+                :label="o.order_no + ' ' + o.product_name + '（未领 ' + formatNum(o.remaining_qty) + ' 张）'" :value="o.id"></el-option>
             </el-select>
           </el-form-item>
           <el-form-item label="备注">
@@ -1036,6 +1037,12 @@ const Papers = {
         const stockType = ref('in');
         const stockRow = ref(null);
         const stockForm = reactive({ quantity: 500, order: null, note: '' });
+
+        // 出库可关联的订单：仅限用纸为当前纸张的订单（服务端同样校验，防挂错纸）
+        const orderOptions = computed(() => {
+            if (!stockRow.value) return [];
+            return activeOrders.value.filter(o => o.paper === stockRow.value.id);
+        });
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
 
@@ -1093,7 +1100,7 @@ const Papers = {
         onMounted(load);
         return {
             loading, papers, txs, activeOrders, PAPER_TYPES,
-            formVisible, editing, form, stockVisible, stockType, stockRow, stockForm,
+            formVisible, editing, form, stockVisible, stockType, stockRow, stockForm, orderOptions,
             formatNum, openEdit, save, openStock, doStock,
         };
     },

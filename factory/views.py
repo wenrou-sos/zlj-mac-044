@@ -1,5 +1,8 @@
-from django.db import transaction
-from django.db.models import Count, IntegerField, Q, Sum, Value
+import time
+from functools import wraps
+
+from django.db import OperationalError, transaction
+from django.db.models import Count, F, IntegerField, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from .models import today
 from rest_framework import viewsets
@@ -29,6 +32,24 @@ from .serializers import (
 )
 
 
+def retry_on_db_lock(times=3, delay=0.05):
+    """SQLite 下并发写冲突（database is locked）时整事务重试，
+    让后到的事务读到已提交数据后按业务校验正常返回（如"已全部领完"），
+    而不是向用户抛 500。"""
+    def deco(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(times):
+                try:
+                    return func(*args, **kwargs)
+                except OperationalError as e:
+                    if 'locked' not in str(e).lower() or attempt == times - 1:
+                        raise
+                    time.sleep(delay * (attempt + 1))
+        return wrapper
+    return deco
+
+
 class CustomerViewSet(viewsets.ModelViewSet):
     queryset = Customer.objects.all().order_by('name')
     serializer_class = CustomerSerializer
@@ -53,6 +74,7 @@ class PaperViewSet(viewsets.ModelViewSet):
         return qty
 
     @action(detail=True, methods=['post'])
+    @retry_on_db_lock()
     def stock_in(self, request, pk=None):
         """入库：增加库存并写流水"""
         paper = self.get_object()
@@ -60,35 +82,78 @@ class PaperViewSet(viewsets.ModelViewSet):
         if qty <= 0:
             return Response({'detail': '入库数量必须大于 0'}, status=400)
         with transaction.atomic():
-            paper.stock += qty
-            paper.save(update_fields=['stock'])
+            # F 表达式原子累加，并发入库不会互相覆盖
+            Paper.objects.filter(pk=paper.pk).update(stock=F('stock') + qty)
             PaperTransaction.objects.create(
                 paper=paper, tx_type=PaperTransaction.TxType.IN, quantity=qty,
                 tx_date=today(), note=request.data.get('note') or '采购入库',
             )
+        paper.refresh_from_db()
         return Response(PaperSerializer(paper).data)
 
     @action(detail=True, methods=['post'])
+    @retry_on_db_lock()
     def stock_out(self, request, pk=None):
-        """出库（领料）：扣减库存并写流水"""
+        """出库（领料）：扣减库存并写流水。
+
+        关联订单时校验：纸张必须与订单用纸一致、不得超出订单未领数量，
+        防止同一订单被重复扣料；库存扣减为单条 SQL 原子操作，
+        两笔出库同时提交也不会只扣一笔。
+        """
         paper = self.get_object()
         qty = self._parse_qty(request)
         if qty <= 0:
             return Response({'detail': '出库数量必须大于 0'}, status=400)
-        if qty > paper.stock:
-            return Response({'detail': f'库存不足，当前库存 {paper.stock} 张'}, status=400)
-        order = None
         order_id = request.data.get('order')
-        if order_id:
-            order = Order.objects.filter(pk=order_id).first()
+
+        def reject(message):
+            # atomic 块内 return 会正常提交而非回滚，必须显式标记回滚，
+            # 否则校验失败时上面的库存扣减会被一并提交
+            transaction.set_rollback(True)
+            return Response({'detail': message}, status=400)
+
         with transaction.atomic():
-            paper.stock -= qty
-            paper.save(update_fields=['stock'])
+            # 条件原子扣减：stock>=qty 的判断与扣减在同一条 UPDATE 内完成，
+            # 并发请求在数据库层串行，库存与流水始终一致
+            updated = (Paper.objects.filter(pk=paper.pk, stock__gte=qty)
+                       .update(stock=F('stock') - qty))
+            if not updated:
+                stock = (Paper.objects.filter(pk=paper.pk)
+                         .values_list('stock', flat=True).first())
+                return reject(f'库存不足：当前库存 {int(stock)} 张，'
+                              f'本次需出库 {qty} 张，还差 {qty - int(stock)} 张')
+
+            order = None
+            if order_id:
+                # 校验在扣减之后、提交之前：任一校验失败整体回滚，库存不会被扣
+                order = (Order.objects.filter(pk=order_id)
+                         .select_related('paper').first())
+                if order is None:
+                    return reject('关联订单不存在')
+                if order.paper_id != paper.id:
+                    return reject(f'订单 {order.order_no} 的用纸是「{order.paper}」，'
+                                  f'与当前出库纸张「{paper}」不一致，请核对后再出库')
+                if order.paper_consumption <= 0:
+                    return reject(f'订单 {order.order_no} 未填写用纸量，不能关联领料出库')
+                received = (PaperTransaction.objects
+                            .filter(order=order, paper=paper,
+                                    tx_type=PaperTransaction.TxType.OUT)
+                            .aggregate(s=Sum('quantity'))['s'] or 0)
+                remaining = order.paper_consumption - received
+                if remaining <= 0:
+                    return reject(f'订单 {order.order_no} 用纸量 {order.paper_consumption} 张'
+                                  f'已全部领完（已领 {received} 张），请勿重复领料')
+                if qty > remaining:
+                    return reject(f'超出订单 {order.order_no} 未领数量：'
+                                  f'用纸量 {order.paper_consumption} 张，已领 {received} 张，'
+                                  f'未领 {remaining} 张，本次最多可领 {remaining} 张')
+
             PaperTransaction.objects.create(
                 paper=paper, tx_type=PaperTransaction.TxType.OUT, quantity=qty,
                 order=order, tx_date=today(),
                 note=request.data.get('note') or '生产领料',
             )
+        paper.refresh_from_db()
         return Response(PaperSerializer(paper).data)
 
 
@@ -101,11 +166,12 @@ class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
 
     def get_queryset(self):
-        # 注解已领料张数（该订单的出库流水合计），避免列表逐单查询
+        # 注解已领料张数（该订单、且纸张与订单用纸一致的出库流水合计），避免列表逐单查询
         return Order.objects.select_related('customer', 'paper', 'progress').annotate(
             received_qty_annotated=Coalesce(
                 Sum('papertransaction__quantity',
-                    filter=Q(papertransaction__tx_type=PaperTransaction.TxType.OUT)),
+                    filter=Q(papertransaction__tx_type=PaperTransaction.TxType.OUT)
+                           & Q(papertransaction__paper_id=F('paper_id'))),
                 Value(0), output_field=IntegerField(),
             )
         )
@@ -156,6 +222,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     @action(detail=True, methods=['post'])
+    @retry_on_db_lock()
     def receive_paper(self, request, pk=None):
         """订单领料：按用纸量从订单对应纸张出库。
 
@@ -175,7 +242,8 @@ class OrderViewSet(viewsets.ModelViewSet):
                                 status=400)
 
             received = (PaperTransaction.objects
-                        .filter(order=order, tx_type=PaperTransaction.TxType.OUT)
+                        .filter(order=order, paper=paper,
+                                tx_type=PaperTransaction.TxType.OUT)
                         .aggregate(s=Sum('quantity'))['s'] or 0)
             remaining = order.paper_consumption - received
             if remaining <= 0:
@@ -207,8 +275,16 @@ class OrderViewSet(viewsets.ModelViewSet):
                                f'本次需领 {qty} 张，还差 {qty - stock} 张'},
                     status=400)
 
-            paper.stock -= qty
-            paper.save(update_fields=['stock'])
+            # 条件原子扣减：与纸张页出库同一口径，并发领料不会少扣
+            updated = (Paper.objects.filter(pk=paper.pk, stock__gte=qty)
+                       .update(stock=F('stock') - qty))
+            if not updated:
+                current = int((Paper.objects.filter(pk=paper.pk)
+                               .values_list('stock', flat=True).first()))
+                return Response(
+                    {'detail': f'库存不足：当前库存 {current} 张，'
+                               f'本次需领 {qty} 张，还差 {qty - current} 张'},
+                    status=400)
             tx = PaperTransaction.objects.create(
                 paper=paper, tx_type=PaperTransaction.TxType.OUT, quantity=qty,
                 order=order, tx_date=today(),
