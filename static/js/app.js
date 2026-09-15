@@ -67,6 +67,19 @@ function todayStr() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
+function fmtDate(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function monthStartStr() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
+}
+function defaultMonthRange() {
+    return [monthStartStr(), todayStr()];
+}
+function formatMoney(n) {
+    return Number(n || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
 
 /* ============================================================
  * 视图一：生产看板
@@ -85,6 +98,74 @@ const Dashboard = {
           </div>
         </el-col>
       </el-row>
+
+      <div class="panel" style="margin-top:16px" v-loading="lossLoading">
+        <div class="panel-title">返工损耗汇总
+          <div>
+            <el-date-picker v-model="lossRange" type="daterange" size="small" style="width:260px"
+              value-format="YYYY-MM-DD" range-separator="至" start-placeholder="开始日期" end-placeholder="结束日期"
+              :shortcuts="dateShortcuts" @change="loadLoss"></el-date-picker>
+            <el-radio-group v-model="lossGroup" size="small" style="margin-left:12px" @change="loadLoss">
+              <el-radio-button label="reason">按返工原因</el-radio-button>
+              <el-radio-button label="machine">按机台</el-radio-button>
+            </el-radio-group>
+            <el-button link type="primary" size="small" style="margin-left:8px" @click="go('reworks')">返工单明细 →</el-button>
+          </div>
+        </div>
+        <el-row :gutter="16" style="margin-bottom:14px">
+          <el-col :span="6">
+            <div class="loss-total">
+              <div class="lt-label">返工单数</div>
+              <div class="lt-val">{{ formatNum(lossData.total.records || 0) }} <span class="lt-unit">单</span></div>
+            </div>
+          </el-col>
+          <el-col :span="6">
+            <div class="loss-total">
+              <div class="lt-label">返工数量</div>
+              <div class="lt-val">{{ formatNum(lossData.total.qty || 0) }} <span class="lt-unit">份</span></div>
+            </div>
+          </el-col>
+          <el-col :span="6">
+            <div class="loss-total">
+              <div class="lt-label">补投纸张</div>
+              <div class="lt-val">{{ formatNum(lossData.total.makeup_sheets || 0) }} <span class="lt-unit">张</span></div>
+            </div>
+          </el-col>
+          <el-col :span="6">
+            <div class="loss-total cost">
+              <div class="lt-label">损耗金额（按用纸单价折算）</div>
+              <div class="lt-val">¥{{ formatMoney(lossData.total.loss_amount || 0) }}</div>
+            </div>
+          </el-col>
+        </el-row>
+        <el-table :data="lossRows" size="small" border style="cursor:pointer"
+                  @row-click="drillLoss" empty-text="该时间段内没有返工记录">
+          <el-table-column :label="lossGroup==='reason' ? '返工原因' : '返工机台'" min-width="200">
+            <template #default="{ row }">
+              <strong>{{ row.label }}</strong>
+              <span v-if="row.machine_type" class="muted" style="margin-left:6px">{{ row.machine_type }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="records" label="返工单数" width="100" align="right">
+            <template #default="{ row }">{{ formatNum(row.records) }}</template>
+          </el-table-column>
+          <el-table-column label="返工数量(份)" width="130" align="right">
+            <template #default="{ row }">{{ formatNum(row.qty) }}</template>
+          </el-table-column>
+          <el-table-column label="补投张数(张)" width="140" align="right">
+            <template #default="{ row }">{{ formatNum(row.makeup_sheets) }}</template>
+          </el-table-column>
+          <el-table-column label="损耗金额(元)" width="150" align="right">
+            <template #default="{ row }"><span style="color:#f56c6c;font-weight:600">¥{{ formatMoney(row.loss_amount) }}</span></template>
+          </el-table-column>
+          <el-table-column label="金额占比" min-width="180">
+            <template #default="{ row }">
+              <el-progress :percentage="amountPct(row.loss_amount)" :stroke-width="12" :show-text="false" status="exception"></el-progress>
+              <span class="muted" style="font-size:12px">{{ amountPct(row.loss_amount) }}%</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
 
       <el-row :gutter="16" style="margin-top:16px">
         <el-col :span="16">
@@ -174,7 +255,7 @@ const Dashboard = {
         </el-col>
       </el-row>
     </div>`,
-    emits: ['go', 'go-orders', 'open-order'],
+    emits: ['go', 'go-orders', 'open-order', 'go-reworks'],
     setup(_, { emit }) {
         const loading = ref(false);
         const warnTab = ref('overdue');
@@ -183,6 +264,47 @@ const Dashboard = {
             warning_orders: [], low_papers: [], stage_stats: {}, weekly_load: [],
         });
         const machines = ref([]);
+
+        // ---- 返工损耗汇总 ----
+        const lossLoading = ref(false);
+        const lossGroup = ref('reason');
+        const lossRange = ref(defaultMonthRange());
+        const lossData = reactive({ total: {}, by_reason: [], by_machine: [] });
+        const dateShortcuts = [
+            { text: '本月', value: () => defaultMonthRange() },
+            { text: '近30天', value: () => { const e = new Date(); const s = new Date(); s.setDate(s.getDate() - 29); return [fmtDate(s), fmtDate(e)]; } },
+            { text: '近90天', value: () => { const e = new Date(); const s = new Date(); s.setDate(s.getDate() - 89); return [fmtDate(s), fmtDate(e)]; } },
+            { text: '今年以来', value: () => { const e = new Date(); return [`${e.getFullYear()}-01-01`, fmtDate(e)]; } },
+        ];
+        const lossRows = computed(() =>
+            lossGroup.value === 'reason' ? lossData.by_reason : lossData.by_machine);
+        function amountPct(v) {
+            const total = Number(lossData.total.loss_amount || 0);
+            if (!total) return 0;
+            return Math.round(Number(v) / total * 1000) / 10;
+        }
+        async function loadLoss() {
+            lossLoading.value = true;
+            try {
+                const qs = new URLSearchParams();
+                if (lossRange.value && lossRange.value.length === 2) {
+                    qs.append('start_date', lossRange.value[0]);
+                    qs.append('end_date', lossRange.value[1]);
+                }
+                const d = await apiGet('/reworks/loss_summary/?' + qs.toString());
+                Object.assign(lossData, { total: d.total, by_reason: d.by_reason, by_machine: d.by_machine });
+            } catch (e) { ElMessage.error(e.message); } finally { lossLoading.value = false; }
+        }
+        // 点击分组行：带时间段+原因/机台条件下钻到返工单列表
+        function drillLoss(row) {
+            const filters = {
+                start_date: lossRange.value?.[0] || '',
+                end_date: lossRange.value?.[1] || '',
+            };
+            if (lossGroup.value === 'reason') filters.reason = row.key;
+            else filters.machine = row.key;
+            emit('go-reworks', filters);
+        }
 
         const cards = computed(() => [
             { key: 'active', label: '在制订单', value: data.summary.active_orders ?? '-', icon: '📋', color: '#409eff', to: null },
@@ -215,11 +337,14 @@ const Dashboard = {
                     else if (data.warning_orders.length) warnTab.value = 'warning';
                 }
             } catch (e) { ElMessage.error(e.message); } finally { loading.value = false; }
+            loadLoss();
         });
 
         return {
             loading, warnTab, data, machines, cards, warnList, ORDER_STATUS, MACHINE_STATUS,
-            barHeight, daysText, daysClass, formatNum, go, openOrder,
+            barHeight, daysText, daysClass, formatNum, formatMoney, go, openOrder,
+            lossLoading, lossGroup, lossRange, lossData, lossRows, dateShortcuts,
+            amountPct, loadLoss, drillLoss,
         };
     },
 };
@@ -443,6 +568,12 @@ const Orders = {
                       {{ r.stage_display }} · {{ r.reason_display }} · {{ formatNum(r.qty) }}份
                       <el-tag :type="REWORK_STATUS[r.status].type" size="small" style="margin-left:6px">{{ r.status_display }}</el-tag>
                     </div>
+                    <div style="margin-top:2px">
+                      <el-tag size="small" effect="plain" type="info" style="margin-right:6px">{{ r.machine_name || '未指定机台' }}</el-tag>
+                      <span v-if="r.makeup_sheets">补投 {{ formatNum(r.makeup_sheets) }} 张 ·
+                        <span style="color:#f56c6c;font-weight:600">损耗 ¥{{ formatMoney(r.loss_amount) }}</span>
+                      </span>
+                    </div>
                     <div class="muted" style="margin:4px 0">{{ r.description }}</div>
                     <div v-if="r.result" style="font-size:13px">处理结果：{{ r.result }}</div>
                     <div class="muted" style="font-size:12px">责任人：{{ r.handler || '—' }}</div>
@@ -521,13 +652,24 @@ const Orders = {
       </el-dialog>
 
       <!-- 返工单对话框 -->
-      <el-dialog v-model="reworkDialog" title="登记返工单" width="520px">
-        <el-form :model="rform" label-width="82px">
-          <el-form-item label="返工工序" required>
-            <el-select v-model="rform.stage" style="width:100%">
-              <el-option v-for="st in STAGES" :key="st.key" :label="st.label" :value="st.key"></el-option>
-            </el-select>
-          </el-form-item>
+      <el-dialog v-model="reworkDialog" title="登记返工单" width="560px">
+        <el-form :model="rform" label-width="96px">
+          <el-row :gutter="12">
+            <el-col :span="12">
+              <el-form-item label="返工工序" required>
+                <el-select v-model="rform.stage" style="width:100%">
+                  <el-option v-for="st in STAGES" :key="st.key" :label="st.label" :value="st.key"></el-option>
+                </el-select>
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="返工机台">
+                <el-select v-model="rform.machine" clearable filterable placeholder="选择返工机台" style="width:100%">
+                  <el-option v-for="m in machines" :key="m.id" :label="m.name" :value="m.id"></el-option>
+                </el-select>
+              </el-form-item>
+            </el-col>
+          </el-row>
           <el-row :gutter="12">
             <el-col :span="12">
               <el-form-item label="返工原因" required>
@@ -542,6 +684,16 @@ const Orders = {
               </el-form-item>
             </el-col>
           </el-row>
+          <el-form-item label="补投张数">
+            <el-input-number v-model="rform.makeup_sheets" :min="0" :step="100" style="width:100%"></el-input-number>
+            <div class="muted" style="line-height:1.6">
+              补投纸张按本单用纸单价
+              <strong>{{ detailPaper ? Number(detailPaper.unit_price).toFixed(4) : '0.0000' }}</strong> 元/张折算，
+              预计损耗金额
+              <strong :style="{color: estLossAmount ? '#f56c6c' : '#909399'}">¥{{ formatMoney(estLossAmount) }}</strong>
+              （保存时由系统自动计算）
+            </div>
+          </el-form-item>
           <el-form-item label="责任人">
             <el-input v-model="rform.handler"></el-input>
           </el-form-item>
@@ -582,9 +734,14 @@ const Orders = {
         const sform = reactive({ machine: null, planned_date: todayStr(), shift: '白班', planned_qty: 0, actual_qty: 0, remark: '' });
 
         const reworkDialog = ref(false);
-        const rform = reactive({ stage: 'printing', reason: 'color', qty: 100, handler: '', found_at: todayStr(), description: '' });
+        const rform = reactive({ stage: 'printing', reason: 'color', qty: 100, machine: null, makeup_sheets: 0, handler: '', found_at: todayStr(), description: '' });
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
+        function formatMoney(n) { return Number(n || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+        // 当前详情订单的用纸（返工单按该纸单价折算补投金额）
+        const detailPaper = computed(() => papers.value.find(p => p.id === detail.value.paper) || null);
+        const estLossAmount = computed(() =>
+            (Number(rform.makeup_sheets) || 0) * Number(detailPaper.value?.unit_price || 0));
 
         function stageClass(row, key) {
             const s = row.progress[key + '_status'];
@@ -721,14 +878,17 @@ const Orders = {
         }
 
         function openRework() {
-            Object.assign(rform, { stage: 'printing', reason: 'color', qty: 100, handler: '', found_at: todayStr(), description: '' });
+            // 默认机台取该订单最近一次排产的机台
+            const lastMachine = [...(detail.value.schedules || [])]
+                .sort((a, b) => (b.planned_date || '').localeCompare(a.planned_date || ''))[0]?.machine || null;
+            Object.assign(rform, { stage: 'printing', reason: 'color', qty: 100, machine: lastMachine, makeup_sheets: 0, handler: '', found_at: todayStr(), description: '' });
             reworkDialog.value = true;
         }
         async function saveRework() {
             if (!rform.description) { ElMessage.warning('请填写问题描述'); return; }
             try {
                 await apiPost('/reworks/', { order: detail.value.id, ...rform });
-                ElMessage.success('返工单已登记，订单已转入返工状态');
+                ElMessage.success('返工单已登记，订单已转入返工状态，损耗金额已按用纸单价折算');
                 reworkDialog.value = false;
                 await refreshDetail();
                 load();
@@ -751,7 +911,8 @@ const Orders = {
             formVisible, editing, form, detailVisible, detail,
             progressDialog, pform, schedDialog, sform, reworkDialog, rform,
             ORDER_STATUS, STAGE_STATUS, STAGES, REWORK_STATUS, REWORK_REASONS, WARNING_LEVEL,
-            formatNum, stageClass, activeStage, progressStatus, canMarkDone,
+            formatNum, formatMoney, detailPaper, estLossAmount,
+            stageClass, activeStage, progressStatus, canMarkDone,
             load, reset, openCreate, openEdit, saveOrder, openDetail,
             openProgress, saveProgress, openSchedule, saveSchedule, toggleSchedule,
             openRework, saveRework,
@@ -1243,34 +1404,95 @@ const Reworks = {
     template: `
     <div v-loading="loading">
       <el-row :gutter="16" style="margin-bottom:16px">
-        <el-col :span="8">
+        <el-col :span="6">
           <div class="stat-card"><div class="icon" style="background:#f56c6c">⚠️</div>
             <div><div class="num">{{ count.open }}</div><div class="label">待处理</div></div></div>
         </el-col>
-        <el-col :span="8">
+        <el-col :span="6">
           <div class="stat-card"><div class="icon" style="background:#e6a23c">🔧</div>
             <div><div class="num">{{ count.processing }}</div><div class="label">返工中</div></div></div>
         </el-col>
-        <el-col :span="8">
+        <el-col :span="6">
           <div class="stat-card"><div class="icon" style="background:#67c23a">✅</div>
             <div><div class="num">{{ count.closed }}</div><div class="label">本月已闭环</div></div></div>
+        </el-col>
+        <el-col :span="6">
+          <div class="stat-card"><div class="icon" style="background:#909399">💸</div>
+            <div><div class="num" style="font-size:22px">¥{{ formatMoney(filteredLoss.amount) }}</div>
+              <div class="label">当前筛选 · {{ formatNum(filteredLoss.records) }}单 / 补投{{ formatNum(filteredLoss.sheets) }}张</div></div></div>
         </el-col>
       </el-row>
 
       <div class="panel">
+        <div class="panel-title">返工损耗汇总（按发现日期）
+          <el-radio-group v-model="lossGroup" size="small">
+            <el-radio-button label="reason">按原因</el-radio-button>
+            <el-radio-button label="machine">按机台</el-radio-button>
+          </el-radio-group>
+        </div>
+        <el-table :data="lossRows" size="small" border empty-text="该筛选条件下暂无返工单" style="cursor:pointer" @row-click="drillSummary">
+          <el-table-column :label="lossGroup==='reason' ? '返工原因' : '返工机台'" min-width="180">
+            <template #default="{ row }">
+              <strong>{{ row.label }}</strong>
+              <span v-if="row.machine_type" class="muted" style="margin-left:6px">{{ row.machine_type }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="单数" width="80" align="right">
+            <template #default="{ row }">{{ formatNum(row.records) }}</template>
+          </el-table-column>
+          <el-table-column label="返工数量(份)" width="130" align="right">
+            <template #default="{ row }">{{ formatNum(row.qty) }}</template>
+          </el-table-column>
+          <el-table-column label="补投张数(张)" width="130" align="right">
+            <template #default="{ row }">{{ formatNum(row.makeup_sheets) }}</template>
+          </el-table-column>
+          <el-table-column label="损耗金额(元)" width="140" align="right">
+            <template #default="{ row }"><span style="color:#f56c6c;font-weight:600">¥{{ formatMoney(row.loss_amount) }}</span></template>
+          </el-table-column>
+          <el-table-column label="金额占比" min-width="160">
+            <template #default="{ row }">
+              <el-progress :percentage="amountPct(row.loss_amount)" :stroke-width="12" :show-text="false" status="exception"></el-progress>
+              <span class="muted" style="font-size:12px">{{ amountPct(row.loss_amount) }}%</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+
+      <div class="panel">
         <div class="panel-title">返工单列表
-          <el-radio-group v-model="filter" size="small" @change="load">
-            <el-radio-button label="">全部</el-radio-button>
+          <el-radio-group v-model="filters.status" size="small" @change="load">
+            <el-radio-button label="">全部状态</el-radio-button>
             <el-radio-button label="open">待处理</el-radio-button>
             <el-radio-button label="processing">返工中</el-radio-button>
             <el-radio-button label="closed">已闭环</el-radio-button>
           </el-radio-group>
         </div>
+        <el-form :inline="true" @submit.prevent style="margin-bottom:4px">
+          <el-form-item label="时间段">
+            <el-date-picker v-model="dateRange" type="daterange" style="width:260px"
+              value-format="YYYY-MM-DD" range-separator="至" start-placeholder="发现日期起"
+              end-placeholder="发现日期止" @change="load"></el-date-picker>
+          </el-form-item>
+          <el-form-item label="原因">
+            <el-select v-model="filters.reason" placeholder="全部原因" clearable style="width:140px" @change="load">
+              <el-option v-for="(v, k) in REWORK_REASONS" :key="k" :label="v" :value="k"></el-option>
+            </el-select>
+          </el-form-item>
+          <el-form-item label="机台">
+            <el-select v-model="filters.machine" placeholder="全部机台" clearable filterable style="width:200px" @change="load">
+              <el-option v-for="m in machines" :key="m.id" :label="m.name" :value="String(m.id)"></el-option>
+              <el-option label="未指定机台" value="none"></el-option>
+            </el-select>
+          </el-form-item>
+          <el-form-item>
+            <el-button @click="resetFilters">重置</el-button>
+          </el-form-item>
+        </el-form>
         <el-table :data="reworks" border stripe @row-click="openDetail" style="cursor:pointer">
           <el-table-column prop="id" label="单号" width="70">
             <template #default="{ row }">#{{ row.id }}</template>
           </el-table-column>
-          <el-table-column label="订单" min-width="240">
+          <el-table-column label="订单" min-width="210">
             <template #default="{ row }">
               <div style="font-weight:600">{{ row.order_no }}</div>
               <div class="muted">{{ row.product_name }}</div>
@@ -1281,11 +1503,23 @@ const Reworks = {
               <el-tag size="small">{{ row.stage_display }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="原因" width="110">
+          <el-table-column label="原因" width="100">
             <template #default="{ row }">{{ row.reason_display }}</template>
           </el-table-column>
-          <el-table-column label="数量" width="100">
-            <template #default="{ row }">{{ formatNum(row.qty) }} 份</template>
+          <el-table-column label="机台" min-width="150">
+            <template #default="{ row }">{{ row.machine_name || '—' }}</template>
+          </el-table-column>
+          <el-table-column label="返工/补投" width="130">
+            <template #default="{ row }">
+              <div>{{ formatNum(row.qty) }} 份</div>
+              <div class="muted">补投 {{ formatNum(row.makeup_sheets) }} 张</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="损耗金额" width="110" align="right">
+            <template #default="{ row }">
+              <span v-if="row.loss_amount" style="color:#f56c6c;font-weight:600">¥{{ formatMoney(row.loss_amount) }}</span>
+              <span v-else class="muted">—</span>
+            </template>
           </el-table-column>
           <el-table-column prop="handler" label="责任人" width="120">
             <template #default="{ row }">{{ row.handler || '—' }}</template>
@@ -1319,10 +1553,17 @@ const Reworks = {
             <el-descriptions-item label="产品">{{ detail.product_name }}</el-descriptions-item>
             <el-descriptions-item label="返工工序">{{ detail.stage_display }}</el-descriptions-item>
             <el-descriptions-item label="返工原因">{{ detail.reason_display }}</el-descriptions-item>
-            <el-descriptions-item label="返工数量">{{ formatNum(detail.qty) }} 份</el-descriptions-item>
+            <el-descriptions-item label="返工机台">{{ detail.machine_name || '—' }}</el-descriptions-item>
             <el-descriptions-item label="责任人">{{ detail.handler || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="返工数量">{{ formatNum(detail.qty) }} 份</el-descriptions-item>
             <el-descriptions-item label="发现日期">{{ detail.found_at }}</el-descriptions-item>
-            <el-descriptions-item label="状态">
+            <el-descriptions-item label="补投张数">{{ formatNum(detail.makeup_sheets) }} 张</el-descriptions-item>
+            <el-descriptions-item label="用纸单价">{{ Number(detail.paper_unit_price).toFixed(4) }} 元/张</el-descriptions-item>
+            <el-descriptions-item label="损耗金额" :span="2">
+              <span style="color:#f56c6c;font-weight:700;font-size:16px">¥{{ formatMoney(detail.loss_amount) }}</span>
+              <span class="muted" style="margin-left:8px">{{ detail.paper_name }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="状态" :span="2">
               <el-tag :type="REWORK_STATUS[detail.status].type" size="small">{{ detail.status_display }}</el-tag>
             </el-descriptions-item>
           </el-descriptions>
@@ -1358,12 +1599,36 @@ const Reworks = {
         </template>
       </el-dialog>
     </div>`,
+    props: ['autoFilter'],
     emits: ['refresh-dashboard'],
-    setup(_, { emit }) {
+    setup(props, { emit }) {
         const loading = ref(false);
         const reworks = ref([]);
-        const filter = ref('');
+        const machines = ref([]);
+        const filters = reactive({ status: '', reason: '', machine: '' });
+        const dateRange = ref(null);
         const count = reactive({ open: 0, processing: 0, closed: 0 });
+
+        const lossGroup = ref('reason');
+        const lossSummary = ref({ total: {}, by_reason: [], by_machine: [] });
+        const lossRows = computed(() =>
+            lossGroup.value === 'reason' ? lossSummary.value.by_reason : lossSummary.value.by_machine);
+        const filteredLoss = computed(() => ({
+            records: lossSummary.value.total.records || 0,
+            sheets: lossSummary.value.total.makeup_sheets || 0,
+            amount: lossSummary.value.total.loss_amount || 0,
+        }));
+        function amountPct(v) {
+            const total = Number(lossSummary.value.total.loss_amount || 0);
+            if (!total) return 0;
+            return Math.round(Number(v) / total * 1000) / 10;
+        }
+        function drillSummary(row) {
+            if (!row.records) return;
+            if (lossGroup.value === 'reason') filters.reason = row.key;
+            else filters.machine = String(row.key);
+            load();
+        }
 
         const detailVisible = ref(false);
         const detail = ref({});
@@ -1373,18 +1638,40 @@ const Reworks = {
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
 
+        function buildQuery(extra = {}) {
+            const qs = new URLSearchParams();
+            if (filters.status) qs.append('status', filters.status);
+            if (filters.reason) qs.append('reason', filters.reason);
+            if (filters.machine) qs.append('machine', filters.machine);
+            if (dateRange.value && dateRange.value.length === 2) {
+                if (dateRange.value[0]) qs.append('start_date', dateRange.value[0]);
+                if (dateRange.value[1]) qs.append('end_date', dateRange.value[1]);
+            }
+            Object.entries(extra).forEach(([k, v]) => v && qs.append(k, v));
+            const s = qs.toString();
+            return s ? '?' + s : '';
+        }
+
         async function load() {
             loading.value = true;
             try {
-                const url = filter.value ? '/reworks/?status=' + filter.value : '/reworks/';
-                reworks.value = await apiGet(url);
-                const all = filter.value ? reworks.value : reworks.value;
-                const allData = filter.value ? await apiGet('/reworks/') : reworks.value;
-                count.open = allData.filter(r => r.status === 'open').length;
-                count.processing = allData.filter(r => r.status === 'processing').length;
+                const [list, all, summary] = await Promise.all([
+                    apiGet('/reworks/' + buildQuery()),
+                    apiGet('/reworks/'),
+                    apiGet('/reworks/loss_summary/' + buildQuery()),
+                ]);
+                reworks.value = list;
+                lossSummary.value = summary;
+                count.open = all.filter(r => r.status === 'open').length;
+                count.processing = all.filter(r => r.status === 'processing').length;
                 const month = todayStr().slice(0, 7);
-                count.closed = allData.filter(r => r.status === 'closed' && (r.closed_at || '').startsWith(month)).length;
+                count.closed = all.filter(r => r.status === 'closed' && (r.closed_at || '').startsWith(month)).length;
             } catch (e) { ElMessage.error(e.message); } finally { loading.value = false; }
+        }
+        function resetFilters() {
+            Object.assign(filters, { status: '', reason: '', machine: '' });
+            dateRange.value = null;
+            load();
         }
 
         async function openDetail(row) {
@@ -1414,11 +1701,30 @@ const Reworks = {
             } catch (e) { ElMessage.error(e.message); }
         }
 
-        onMounted(load);
+        // 来自看板的下钻：自动带入时间段 / 原因 / 机台
+        function applyAutoFilter(f) {
+            if (!f) return;
+            filters.status = '';
+            filters.reason = f.reason || '';
+            filters.machine = f.machine ? String(f.machine) : '';
+            dateRange.value = (f.start_date || f.end_date) ? [f.start_date || '', f.end_date || ''] : null;
+            load();
+        }
+
+        watch(() => props.autoFilter, (v) => applyAutoFilter(v));
+
+        onMounted(async () => {
+            machines.value = await apiGet('/machines/');
+            if (props.autoFilter) applyAutoFilter(props.autoFilter);
+            else load();
+        });
         return {
-            loading, reworks, filter, count, detailVisible, detail,
-            closeVisible, closeForm, REWORK_STATUS,
-            formatNum, load, openDetail, advance, openClose, doClose,
+            loading, reworks, machines, filters, dateRange, count,
+            lossGroup, lossRows, filteredLoss, amountPct, drillSummary,
+            detailVisible, detail, closeVisible, closeForm,
+            REWORK_STATUS, REWORK_REASONS,
+            formatNum, formatMoney, load, resetFilters,
+            openDetail, advance, openClose, doClose,
         };
     },
 };
@@ -1449,11 +1755,12 @@ const App = {
         </div>
         <div class="content">
           <dashboard v-if="current==='dashboard'" :key="dashKey"
-                     @go="switchView" @go-orders="goOrdersWithStatus" @open-order="openOrder"></dashboard>
+                     @go="switchView" @go-orders="goOrdersWithStatus" @open-order="openOrder"
+                     @go-reworks="goReworksFilter"></dashboard>
           <orders v-else-if="current==='orders'" ref="ordersRef" :key="'orders'+ordersKey" :autoStatus="orderFilter"></orders>
           <papers v-else-if="current==='papers'" :key="'papers'+papersKey"></papers>
           <schedules v-else-if="current==='schedules'" key="schedules"></schedules>
-          <reworks v-else-if="current==='reworks'" :key="'reworks'+reworksKey"></reworks>
+          <reworks v-else-if="current==='reworks'" :key="'reworks'+reworksKey" :autoFilter="reworkFilter"></reworks>
         </div>
       </div>
     </div>`,
@@ -1464,6 +1771,7 @@ const App = {
         const papersKey = ref(0);
         const reworksKey = ref(0);
         const orderFilter = ref('');
+        const reworkFilter = ref(null);
         const ordersRef = ref(null);
 
         const menus = [
@@ -1493,9 +1801,15 @@ const App = {
             await nextTick();
             ordersRef.value?.openDetail(id);
         }
+        function goReworksFilter(filters) {
+            reworkFilter.value = null;
+            current.value = 'reworks';
+            reworksKey.value++;
+            nextTick(() => { reworkFilter.value = filters || {}; });
+        }
 
         return { current, currentMenu, menus, today, weekday, dashKey, ordersKey, papersKey, reworksKey,
-                 orderFilter, ordersRef, switchView, goOrdersWithStatus, openOrder };
+                 orderFilter, reworkFilter, ordersRef, switchView, goOrdersWithStatus, openOrder, goReworksFilter };
     },
 };
 

@@ -187,19 +187,117 @@ class ScheduleViewSet(viewsets.ModelViewSet):
 
 
 class ReworkViewSet(viewsets.ModelViewSet):
-    queryset = ReworkRecord.objects.select_related('order').all()
+    queryset = ReworkRecord.objects.select_related('order', 'order__paper', 'machine').all()
     serializer_class = ReworkSerializer
 
     def list(self, request, *args, **kwargs):
         qs = self.get_queryset()
         status = request.query_params.get('status')
+        reason = request.query_params.get('reason')
+        machine_id = request.query_params.get('machine')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
         if status:
             qs = qs.filter(status=status)
+        if reason:
+            qs = qs.filter(reason=reason)
+        if machine_id:
+            if machine_id == 'none':
+                qs = qs.filter(machine__isnull=True)
+            else:
+                qs = qs.filter(machine_id=machine_id)
+        if start_date:
+            qs = qs.filter(found_at__gte=start_date)
+        if end_date:
+            qs = qs.filter(found_at__lte=end_date)
         return Response(self.get_serializer(qs, many=True).data)
+
+    @action(detail=False, methods=['get'])
+    def loss_summary(self, request):
+        """返工损耗汇总：按 found_at 过滤时间段，按 reason / machine 分组统计"""
+        qs = self.get_queryset()
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        reason = request.query_params.get('reason')
+        machine_id = request.query_params.get('machine')
+        if start_date:
+            qs = qs.filter(found_at__gte=start_date)
+        if end_date:
+            qs = qs.filter(found_at__lte=end_date)
+        if reason:
+            qs = qs.filter(reason=reason)
+        if machine_id:
+            if machine_id == 'none':
+                qs = qs.filter(machine__isnull=True)
+            else:
+                qs = qs.filter(machine_id=machine_id)
+
+        def _agg(group_qs):
+            a = group_qs.aggregate(
+                records=Count('id'),
+                qty=Sum('qty'),
+                sheets=Sum('makeup_sheets'),
+                amount=Sum('loss_amount'),
+            )
+            return {
+                'records': a['records'] or 0,
+                'qty': a['qty'] or 0,
+                'makeup_sheets': a['sheets'] or 0,
+                'loss_amount': round(float(a['amount'] or 0), 2),
+            }
+
+        reason_groups = []
+        for code, label in ReworkRecord.Reason.choices:
+            reason_groups.append({'key': code, 'label': label, **_agg(qs.filter(reason=code))})
+        reason_groups.sort(key=lambda g: g['loss_amount'], reverse=True)
+
+        machine_groups = []
+        for m in Machine.objects.all().order_by('name'):
+            machine_groups.append({
+                'key': m.id, 'label': m.name, 'machine_type': m.machine_type,
+                **_agg(qs.filter(machine=m)),
+            })
+        # 未登记机台的返工单单列一组，避免漏统计
+        none_stats = _agg(qs.filter(machine__isnull=True))
+        if none_stats['records']:
+            machine_groups.append({
+                'key': 'none', 'label': '未指定机台', 'machine_type': '', **none_stats,
+            })
+        machine_groups.sort(key=lambda g: g['loss_amount'], reverse=True)
+
+        return Response({
+            'filters': {
+                'start_date': start_date or '', 'end_date': end_date or '',
+                'reason': reason or '', 'machine': str(machine_id or ''),
+            },
+            'total': _agg(qs),
+            'by_reason': reason_groups,
+            'by_machine': machine_groups,
+        })
 
     def perform_create(self, serializer):
         """新建返工单：订单与对应工序进入返工状态"""
         instance = serializer.save()
+        self._mark_stage_rework(instance)
+        progress = instance.order.progress
+        progress.sync_order_status()
+
+    def perform_destroy(self, instance):
+        """删除返工单：若无其他未闭环返工单，恢复工序与订单状态"""
+        order = instance.order
+        super().perform_destroy(instance)
+        progress = order.progress
+        if not order.reworks.exclude(status=ReworkRecord.Status.CLOSED).exists():
+            changed = [f for f in ('prepress_status', 'printing_status', 'binding_status')
+                       if getattr(progress, f) == ProcessProgress.State.REWORK]
+            if changed:
+                for f in changed:
+                    setattr(progress, f, ProcessProgress.State.IN_PROGRESS)
+                progress.save(update_fields=changed)
+            progress.sync_order_status()
+
+    @staticmethod
+    def _mark_stage_rework(instance):
         progress = instance.order.progress
         field = {
             'prepress': 'prepress_status',
@@ -209,7 +307,6 @@ class ReworkViewSet(viewsets.ModelViewSet):
         if getattr(progress, field) != ProcessProgress.State.REWORK:
             setattr(progress, field, ProcessProgress.State.REWORK)
             progress.save(update_fields=[field])
-        progress.sync_order_status()
 
 
 class PaperTransactionViewSet(viewsets.ReadOnlyModelViewSet):

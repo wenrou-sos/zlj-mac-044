@@ -52,8 +52,10 @@ class ScheduleAdmin(admin.ModelAdmin):
 
 @admin.register(ReworkRecord)
 class ReworkRecordAdmin(admin.ModelAdmin):
-    list_display = ('id', 'order', 'stage', 'reason', 'qty', 'status', 'found_at', 'closed_at')
-    list_filter = ('status', 'stage', 'reason')
+    list_display = ('id', 'order', 'stage', 'reason', 'machine', 'qty',
+                    'makeup_sheets', 'loss_amount', 'status', 'found_at', 'closed_at')
+    list_filter = ('status', 'stage', 'reason', 'machine')
+    readonly_fields = ('loss_amount',)
 
 
 @admin.register(PaperTransaction)

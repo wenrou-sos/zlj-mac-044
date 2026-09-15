@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 
 from django.db import models
 from django.utils import timezone
@@ -221,9 +222,13 @@ class ReworkRecord(models.Model):
         CLOSED = 'closed', '已闭环'
 
     order = models.ForeignKey(Order, verbose_name='订单', on_delete=models.CASCADE, related_name='reworks')
+    machine = models.ForeignKey(Machine, verbose_name='返工机台', on_delete=models.SET_NULL,
+                                null=True, blank=True, related_name='reworks')
     stage = models.CharField('返工工序', max_length=20, choices=ProcessProgress.Stage.choices)
     reason = models.CharField('返工原因', max_length=20, choices=Reason.choices)
     qty = models.PositiveIntegerField('返工数量(份)', default=0)
+    makeup_sheets = models.PositiveIntegerField('补投张数(张)', default=0)
+    loss_amount = models.DecimalField('损耗金额(元)', max_digits=12, decimal_places=2, default=0)
     status = models.CharField('处理状态', max_length=20, choices=Status.choices, default=Status.OPEN)
     description = models.TextField('问题描述', blank=True)
     handler = models.CharField('责任人', max_length=50, blank=True)
@@ -239,6 +244,11 @@ class ReworkRecord(models.Model):
 
     def __str__(self):
         return f'返工单 {self.id} - {self.order.order_no}'
+
+    def calc_loss_amount(self):
+        """按订单用纸单价折算补投纸张损耗金额"""
+        return (Decimal(self.makeup_sheets or 0)
+                * Decimal(str(self.order.paper.unit_price))).quantize(Decimal('0.01'))
 
 
 class PaperTransaction(models.Model):

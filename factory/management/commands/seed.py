@@ -176,23 +176,71 @@ class Command(BaseCommand):
             )
 
         # ---------------- 返工单 ----------------
-        rw1 = ReworkRecord.objects.create(
-            order=o1, stage='printing', reason='color', qty=1500,
-            status='processing', handler='张师傅（领机）',
-            found_at=today - timedelta(days=1),
-            description='封面大红色实地批次与签样相比偏红约 ΔE 3.2，客户驻厂代表拒收。',
-        )
-        rw1.result = '已重新调配专色油墨，清洗墨辊后重新上机，预计今晚夜班完成。'
-        rw1.save()
+        # (订单, 工序, 原因, 机台, 返工份数, 补投张数, 状态, 发现偏移, 闭环偏移, 责任人, 描述, 结果)
+        def make_rework(order, stage, reason, machine, qty, sheets, status,
+                        found_off, closed_off, handler, desc, result=''):
+            rw = ReworkRecord.objects.create(
+                order=order, stage=stage, reason=reason, machine=machine,
+                qty=qty, makeup_sheets=sheets, status=status, handler=handler,
+                found_at=today + timedelta(days=found_off),
+                closed_at=today + timedelta(days=closed_off) if closed_off is not None else None,
+                description=desc, result=result,
+            )
+            # 损耗金额按订单用纸单价 × 补投张数折算
+            rw.loss_amount = rw.calc_loss_amount()
+            rw.save(update_fields=['loss_amount'])
+            return rw
 
-        ReworkRecord.objects.create(
-            order=o7, stage='binding', reason='binding', qty=200,
-            status='closed', handler='李班长',
-            found_at=today - timedelta(days=8),
-            closed_at=today - timedelta(days=6),
-            description='部分读本骑马钉钉脚偏移，存在散页风险。',
-            result='200 本全部重订，全检后入库；已对装订机订头做校准保养。',
-        )
+        rw1 = make_rework(
+            o1, 'printing', 'color', machines[0], 1500, 800, 'processing',
+            -1, None, '张师傅（领机）',
+            '封面大红色实地批次与签样相比偏红约 ΔE 3.2，客户驻厂代表拒收。',
+            '已重新调配专色油墨，清洗墨辊后重新上机，预计今晚夜班完成。')
+
+        make_rework(
+            o7, 'binding', 'binding', machines[4], 200, 260, 'closed',
+            -8, -6, '李班长',
+            '部分读本骑马钉钉脚偏移，存在散页风险。',
+            '200 本全部重订，全检后入库；已对装订机订头做校准保养。')
+
+        # 以下为近两个月的历史返工单（均已闭环），用于看板损耗汇总统计
+        make_rework(
+            o2, 'printing', 'register', machines[1], 800, 300, 'closed',
+            -7, -6, '王领机',
+            '包装盒正面图案与刀模线套印偏差超 0.3mm，模切后白边明显。',
+            '重新校准规矩与拉规定位，补印 300 张后复检合格。')
+
+        make_rework(
+            o3, 'printing', 'scratch', machines[2], 1200, 1500, 'closed',
+            -12, -10, '赵师傅',
+            '内页第 3 帖出现周期性橡皮布压痕和脏点，疑似橡皮布松动。',
+            '更换橡皮布并清洗滚筒，补投 1500 张重印第 3 帖。')
+
+        make_rework(
+            o5, 'printing', 'color', machines[0], 500, 200, 'closed',
+            -5, -4, '张师傅（领机）',
+            '手提袋专金实地墨色不均，局部发花。',
+            '调整专墨配比与压力，补印 200 张后色差恢复达标。')
+
+        make_rework(
+            o4, 'prepress', 'material', None, 600, 100, 'closed',
+            -18, -17, '印前-孙工',
+            '200g 铜版纸裁切尺寸偏差 2mm，拼版后无法上机，早期单据未登记机台。',
+            '退回纸仓重新裁切，补投 100 张；已与纸仓核对裁切公差。')
+
+        make_rework(
+            o8, 'printing', 'other', machines[1], 100, 150, 'closed',
+            -15, -14, '王领机',
+            '特种纸烫银后局部附着力不足，UV 工序返工。',
+            '调整 UV 灯功率与走纸速度，补投 150 张重新过 UV。')
+
+        make_rework(
+            o7, 'binding', 'scratch', machines[4], 300, 250, 'closed',
+            -12, -11, '李班长',
+            '读本封面覆膜后表面划伤，疑为胶订线导轨毛刺。',
+            '打磨导轨并包覆防护条，补投 250 张封面重做。')
+
+        rework_count = ReworkRecord.objects.count()
 
         # ---------------- 用纸出库流水 ----------------
         for order in [o1, o2, o3, o4, o5, o7, o8]:
@@ -215,5 +263,5 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f'样例数据生成完成：客户 {customers.__len__()} 家、纸张 {len(papers_data)} 种、'
             f'机台 {len(machines)} 台、订单 {len(orders_spec)} 个、'
-            f'排产 {len(schedules)} 条、返工单 2 张'
+            f'排产 {len(schedules)} 条、返工单 {rework_count} 张'
         ))

@@ -186,6 +186,9 @@ class ScheduleSerializer(serializers.ModelSerializer):
 class ReworkSerializer(serializers.ModelSerializer):
     order_no = serializers.CharField(source='order.order_no', read_only=True)
     product_name = serializers.CharField(source='order.product_name', read_only=True)
+    paper_name = serializers.SerializerMethodField()
+    paper_unit_price = serializers.SerializerMethodField()
+    machine_name = serializers.CharField(source='machine.name', read_only=True, allow_null=True)
     stage_display = serializers.CharField(source='get_stage_display', read_only=True)
     reason_display = serializers.CharField(source='get_reason_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
@@ -193,10 +196,35 @@ class ReworkSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReworkRecord
         fields = '__all__'
+        # 损耗金额由系统按 补投张数 × 用纸单价 折算，不允许前端直接写入
+        read_only_fields = ['loss_amount']
+
+    def get_paper_name(self, obj):
+        return f'{obj.order.paper.name} {obj.order.paper.spec}'
+
+    def get_paper_unit_price(self, obj):
+        return obj.order.paper.unit_price
+
+    def validate_makeup_sheets(self, value):
+        if value < 0:
+            raise serializers.ValidationError('补投张数不能为负数')
+        return value
+
+    def _apply_loss_amount(self, instance):
+        instance.loss_amount = instance.calc_loss_amount()
+
+    def create(self, validated_data):
+        instance = super().create(validated_data)
+        self._apply_loss_amount(instance)
+        instance.save(update_fields=['loss_amount'])
+        return instance
 
     def update(self, instance, validated_data):
         from django.utils import timezone
+        # 补投张数/关联订单变化时重算金额（订单本身不允许在返工单上修改）
         instance = super().update(instance, validated_data)
+        self._apply_loss_amount(instance)
+        instance.save(update_fields=['loss_amount'])
 
         order = instance.order
         open_exists = order.reworks.exclude(status=ReworkRecord.Status.CLOSED).exists()

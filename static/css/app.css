@@ -64,3 +64,11 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Helvetica Neue",
 
 .schedule-item { display:flex; align-items:flex-start; gap:8px; padding:8px 10px; margin-bottom:8px; border-radius:6px; background:#ecf5ff; border-left:3px solid #409eff; }
 .schedule-item.done { background:#f0f9eb; border-left-color:#67c23a; opacity:.85; }
+
+.loss-total { background:#f7f9fc; border:1px solid #ebeef5; border-radius:8px; padding:12px 16px; }
+.loss-total.cost { background:#fef0f0; border-color:#fde2e2; }
+.loss-total .lt-label { font-size:12px; color:#909399; margin-bottom:6px; }
+.loss-total.cost .lt-label { color:#f56c6c; }
+.loss-total .lt-val { font-size:22px; font-weight:700; color:#303133; line-height:1.2; }
+.loss-total.cost .lt-val { color:#f56c6c; }
+.loss-total .lt-unit { font-size:12px; font-weight:400; color:#909399; }
