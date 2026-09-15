@@ -1095,7 +1095,8 @@ const Schedules = {
           <el-table-column :label="curDate + ' 排产任务'">
             <template #default="{ row }">
               <el-alert v-if="row.status==='maintenance'" type="warning" :closable="false" show-icon
-                        title="该机台维保中，不能排产" style="margin-bottom:8px">
+                        title="该机台维保中，不能新增排产；转维保前的已有任务仍可完成、编辑或删除"
+                        style="margin-bottom:8px">
                 <el-button type="primary" size="small" @click="openMaintain(row)">登记保养并恢复</el-button>
               </el-alert>
               <div v-if="!row.items.length && row.status!=='maintenance'" class="muted">— 无排产 —</div>
@@ -1140,6 +1141,9 @@ const Schedules = {
             </el-select>
             <div v-if="selectedFormMachine && selectedFormMachine.maintenance_state==='overdue'" style="margin-top:4px">
               <el-tag type="danger" size="small" effect="dark">该机台保养已超期，建议先保养再排产（仍可保存）</el-tag>
+            </div>
+            <div v-else-if="editing && selectedFormMachine && selectedFormMachine.status==='maintenance'" style="margin-top:4px">
+              <el-tag type="warning" size="small" effect="plain">该机台已转维保，本任务可继续保存；如需换机台请改选其他可用机台</el-tag>
             </div>
           </el-form-item>
           <el-form-item label="订单" required>

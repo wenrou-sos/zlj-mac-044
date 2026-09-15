@@ -211,11 +211,20 @@ class ScheduleSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
     def validate(self, attrs):
-        # 维保机台一律禁止排产；PATCH 时取实例当前机台兜底，保证从任何入口都拦得住
-        machine = attrs.get('machine') or getattr(self.instance, 'machine', None)
-        if machine and machine.status == Machine.Status.MAINTENANCE:
-            raise serializers.ValidationError(
-                {'machine': f'机台「{machine.name}」维保中，登记保养完成后方可排产'})
+        # “维保中不能排产”只约束把任务排到维保机台：
+        # - 新建：目标机台维保中 -> 拦截
+        # - 更新：仅当把任务挪到另一台维保机台时拦截；不换机台的更新
+        #   （完成勾选、备注、产量、日期等，针对转维保前已存在的任务）一律放行
+        if self.instance is None:
+            machine = attrs.get('machine')
+            if machine and machine.status == Machine.Status.MAINTENANCE:
+                raise serializers.ValidationError(
+                    {'machine': f'机台「{machine.name}」维保中，登记保养完成后方可排产'})
+        elif 'machine' in attrs and attrs['machine'] != self.instance.machine:
+            machine = attrs['machine']
+            if machine.status == Machine.Status.MAINTENANCE:
+                raise serializers.ValidationError(
+                    {'machine': f'机台「{machine.name}」维保中，不能把任务改排到该机台'})
         return attrs
 
 
