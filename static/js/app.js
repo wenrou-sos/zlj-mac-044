@@ -361,6 +361,36 @@ const Orders = {
               </el-form-item>
             </el-col>
           </el-row>
+          <el-form-item label="建议交期">
+            <div style="width:100%">
+              <div v-if="suggestLoading" class="muted">正在按机台负荷与用纸库存测算…</div>
+              <template v-else-if="suggest">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                  <el-tag type="primary" effect="dark">{{ suggest.suggested_date }}</el-tag>
+                  <el-button link type="primary" size="small" @click="form.due_date = suggest.suggested_date">采用建议</el-button>
+                  <el-button link size="small" @click="fetchSuggest">重新测算</el-button>
+                  <span class="muted">可凭经验直接修改上方交货日期覆盖建议</span>
+                </div>
+                <div class="muted" style="margin-top:4px;line-height:1.7">
+                  机台：{{ suggest.capacity.machine_count }} 台可用（日产能 {{ formatNum(suggest.capacity.daily_capacity) }} 份），
+                  两周内已排 {{ formatNum(suggest.capacity.scheduled_load) }} 份
+                  <template v-if="suggest.customer_wip.count">
+                    ；该客户另有 {{ suggest.customer_wip.count }} 单在制、{{ formatNum(suggest.customer_wip.quantity) }} 份待排产
+                  </template>
+                  <br>
+                  用纸：{{ suggest.paper.name }} 库存 {{ formatNum(suggest.paper.stock) }} 张 / 需 {{ formatNum(suggest.paper.needed) }} 张
+                  <span v-if="suggest.paper.tight" style="color:#f56c6c;font-weight:600">
+                    （缺 {{ formatNum(suggest.paper.shortage) }} 张，采购到货约 {{ suggest.paper.lead_days }} 天）
+                  </span>
+                  <span v-else style="color:#67c23a">（库存够用）</span>
+                </div>
+                <el-alert v-if="form.due_date && form.due_date < suggest.suggested_date" type="warning"
+                  :closable="false" show-icon style="margin-top:6px"
+                  :title="'当前交期早于建议日期，可能偏紧' + tightFactorText"></el-alert>
+              </template>
+              <div v-else class="muted">选择客户、用纸后自动测算建议交期</div>
+            </div>
+          </el-form-item>
           <el-form-item label="备注">
             <el-input v-model="form.remark" type="textarea" :rows="2"></el-input>
           </el-form-item>
@@ -387,6 +417,20 @@ const Orders = {
               <el-tag :type="WARNING_LEVEL[detail.warning_level].type" size="small" effect="dark" style="margin-left:6px">
                 {{ detail.days_left === null ? '已完工' : WARNING_LEVEL[detail.warning_level].label + (detail.days_left<0 ? ' '+(-detail.days_left)+'天' : ' '+detail.days_left+'天') }}
               </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item v-if="detail.due_assessment" label="交期评估" :span="3">
+              <el-tag :type="detail.due_assessment.level==='tight' ? 'danger' : 'success'" size="small" effect="dark">
+                {{ detail.due_assessment.level==='tight' ? '交期偏紧' : '交期可行' }}
+              </el-tag>
+              <template v-if="detail.due_assessment.level==='tight'">
+                <el-tag v-if="detail.due_assessment.capacity_tight" type="warning" size="small" effect="dark" style="margin-left:6px">紧在产能</el-tag>
+                <el-tag v-if="detail.due_assessment.paper_tight" type="warning" size="small" effect="dark" style="margin-left:6px">紧在缺纸</el-tag>
+              </template>
+              <el-tag v-else-if="detail.due_assessment.paper_tight" type="warning" size="small" style="margin-left:6px">用纸待采购</el-tag>
+              <span class="muted" style="margin-left:8px">
+                建议交期 {{ detail.due_assessment.suggested_date }}
+                <template v-if="detail.due_assessment.days_over">（比当前交期晚 {{ detail.due_assessment.days_over }} 天）</template>
+              </span>
             </el-descriptions-item>
             <el-descriptions-item label="备注" :span="3">{{ detail.remark || '—' }}</el-descriptions-item>
           </el-descriptions>
@@ -572,6 +616,36 @@ const Orders = {
         const editing = ref(null);
         const form = reactive({ order_no: '', customer: null, product_name: '', quantity: 5000, paper: null, paper_consumption: 0, order_date: todayStr(), due_date: '', remark: '' });
 
+        // 建议交期测算
+        const suggest = ref(null);
+        const suggestLoading = ref(false);
+        let suggestTimer = null;
+        async function fetchSuggest() {
+            if (!form.customer || !form.paper) { suggest.value = null; return; }
+            suggestLoading.value = true;
+            try {
+                const qs = new URLSearchParams({
+                    customer: form.customer, paper: form.paper,
+                    quantity: form.quantity || 0, paper_consumption: form.paper_consumption || 0,
+                });
+                if (editing.value) qs.append('exclude', editing.value.id);
+                suggest.value = await apiGet('/orders/suggest-due-date/?' + qs.toString());
+            } catch (e) { suggest.value = null; } finally { suggestLoading.value = false; }
+        }
+        function scheduleSuggest() {
+            clearTimeout(suggestTimer);
+            suggestTimer = setTimeout(fetchSuggest, 300);
+        }
+        const tightFactorText = computed(() => {
+            if (!suggest.value) return '';
+            const factors = [];
+            if (suggest.value.capacity.tight) factors.push('产能不足');
+            if (suggest.value.paper.tight) factors.push('缺纸');
+            return factors.length ? `（${factors.join('、')}）` : '';
+        });
+        watch(() => [form.customer, form.paper, form.quantity, form.paper_consumption],
+            () => { if (formVisible.value) scheduleSuggest(); });
+
         const detailVisible = ref(false);
         const detail = ref({});
 
@@ -626,6 +700,7 @@ const Orders = {
         function openCreate() {
             editing.value = null;
             Object.assign(form, { order_no: '', customer: null, product_name: '', quantity: 5000, paper: null, paper_consumption: 0, order_date: todayStr(), due_date: '', remark: '' });
+            suggest.value = null;
             formVisible.value = true;
         }
         function openEdit(row) {
@@ -635,7 +710,9 @@ const Orders = {
                 quantity: row.quantity, paper: row.paper, paper_consumption: row.paper_consumption,
                 order_date: row.order_date, due_date: row.due_date, remark: row.remark || '',
             });
+            suggest.value = null;
             formVisible.value = true;
+            fetchSuggest();
         }
         async function saveOrder() {
             if (!form.order_no || !form.customer || !form.product_name || !form.paper || !form.due_date) {
@@ -750,6 +827,7 @@ const Orders = {
             loading, orders, customers, papers, machines, filters,
             formVisible, editing, form, detailVisible, detail,
             progressDialog, pform, schedDialog, sform, reworkDialog, rform,
+            suggest, suggestLoading, fetchSuggest, tightFactorText,
             ORDER_STATUS, STAGE_STATUS, STAGES, REWORK_STATUS, REWORK_REASONS, WARNING_LEVEL,
             formatNum, stageClass, activeStage, progressStatus, canMarkDone,
             load, reset, openCreate, openEdit, saveOrder, openDetail,

@@ -133,6 +133,37 @@ class OrderViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(qs, many=True)
         return Response(serializer.data)
 
+    @action(detail=False, methods=['get'], url_path='suggest-due-date')
+    def suggest_due_date(self, request):
+        """建议交期：按两周机台负荷、用纸库存、同客户在制订单量测算"""
+        from .suggestion import evaluate_due_date
+
+        def _int(name, required=True, default=0):
+            raw = request.query_params.get(name)
+            if raw in (None, ''):
+                if required:
+                    raise ValueError(name)
+                return default
+            return int(raw)
+
+        try:
+            paper_id = _int('paper')
+            customer_id = _int('customer')
+            quantity = _int('quantity', required=False)
+            consumption = _int('paper_consumption', required=False)
+            exclude = _int('exclude', required=False, default=None)
+        except (TypeError, ValueError):
+            return Response({'detail': '参数不完整或格式错误（需要 paper、customer）'}, status=400)
+        if not Paper.objects.filter(pk=paper_id).exists():
+            return Response({'detail': '纸张不存在'}, status=400)
+        if not Customer.objects.filter(pk=customer_id).exists():
+            return Response({'detail': '客户不存在'}, status=400)
+        return Response(evaluate_due_date(
+            customer_id=customer_id, paper_id=paper_id,
+            quantity=quantity, paper_consumption=consumption,
+            exclude_order_id=exclude,
+        ))
+
     @action(detail=True, methods=['get', 'patch'])
     def progress(self, request, pk=None):
         """读取/更新订单三道工序进度"""

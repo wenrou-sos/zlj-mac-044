@@ -162,15 +162,21 @@ class OrderListSerializer(serializers.ModelSerializer):
 class OrderSerializer(OrderListSerializer):
     schedules = serializers.SerializerMethodField()
     reworks = serializers.SerializerMethodField()
+    due_assessment = serializers.SerializerMethodField()
 
     class Meta(OrderListSerializer.Meta):
-        fields = OrderListSerializer.Meta.fields + ['created_at', 'schedules', 'reworks']
+        fields = OrderListSerializer.Meta.fields + ['created_at', 'schedules', 'reworks', 'due_assessment']
 
     def get_schedules(self, obj):
         return ScheduleSerializer(obj.schedules.select_related('machine'), many=True).data
 
     def get_reworks(self, obj):
         return ReworkSerializer(obj.reworks.all(), many=True).data
+
+    def get_due_assessment(self, obj):
+        """当前交期评估：是否偏紧、紧在产能还是缺纸"""
+        from .suggestion import assess_order
+        return assess_order(obj)
 
 
 class ScheduleSerializer(serializers.ModelSerializer):
