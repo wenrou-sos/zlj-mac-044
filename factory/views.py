@@ -1,9 +1,11 @@
 from django.db import transaction
 from django.db.models import Count, Sum
+from django.shortcuts import get_object_or_404
 from .models import today
 from rest_framework import viewsets
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from rest_framework.serializers import ValidationError
 
 from .models import (
     Customer,
@@ -14,6 +16,7 @@ from .models import (
     ProcessProgress,
     ReworkRecord,
     Schedule,
+    check_schedule_conflict,
 )
 from .serializers import (
     CustomerSerializer,
@@ -159,6 +162,42 @@ class ScheduleViewSet(viewsets.ModelViewSet):
         if machine_id:
             qs = qs.filter(machine_id=machine_id)
         return Response(self.get_serializer(qs, many=True).data)
+
+    @action(detail=False, methods=['get'])
+    def conflicts(self, request):
+        """排产冲突预检：机台/日期/班次/计划量变化后实时调用
+
+        query: machine, date, shift, planned_qty(默认0), exclude(编辑时自身id)
+        返回该班次已排任务、登记产能、合计计划量以及是否阻止保存。
+        """
+        machine_id = request.query_params.get('machine')
+        planned_date = request.query_params.get('date')
+        shift = request.query_params.get('shift')
+        if not machine_id or not planned_date or not shift:
+            raise ValidationError({'detail': 'machine、date、shift 参数必填'})
+        machine = get_object_or_404(Machine, pk=machine_id)
+        try:
+            planned_qty = int(request.query_params.get('planned_qty') or 0)
+        except ValueError:
+            raise ValidationError({'planned_qty': '计划产量必须为整数'})
+        exclude_id = request.query_params.get('exclude')
+
+        result = check_schedule_conflict(
+            machine, planned_date, shift, planned_qty, exclude_id=exclude_id)
+        return Response({
+            'machine': machine.id,
+            'machine_name': machine.name,
+            'date': planned_date,
+            'shift': shift,
+            'planned_qty': planned_qty,
+            'capacity': result['capacity'],
+            'existing_total': result['existing_total'],
+            'remain': result['remain'],
+            'tasks': result['tasks'],
+            'blocked': result['blocked'],
+            'reason': result['reason'],
+            'message': result['message'],
+        })
 
     def perform_create(self, serializer):
         serializer.save()

@@ -72,6 +72,38 @@ class Machine(models.Model):
     def __str__(self):
         return self.name
 
+    def shift_capacity(self, shift):
+        """该机台某班次的登记产能（份），未登记返回 None"""
+        cap = self.shift_capacities.filter(shift=shift).first()
+        return cap.capacity if cap else None
+
+    def shift_planned(self, planned_date, shift):
+        """该机台某天某班次已排任务的计划产量合计"""
+        return self.schedules.filter(
+            planned_date=planned_date, shift=shift
+        ).aggregate(s=models.Sum('planned_qty'))['s'] or 0
+
+
+class MachineShiftCapacity(models.Model):
+    """机台各班次的登记产能（份/班）"""
+
+    class Shift(models.TextChoices):
+        DAY = '白班', '白班'
+        NIGHT = '夜班', '夜班'
+
+    machine = models.ForeignKey(
+        Machine, verbose_name='机台', on_delete=models.CASCADE, related_name='shift_capacities')
+    shift = models.CharField('班次', max_length=10, choices=Shift.choices)
+    capacity = models.PositiveIntegerField('班次产能(份)', default=0)
+
+    class Meta:
+        verbose_name = '机台班次产能'
+        verbose_name_plural = verbose_name
+        unique_together = ('machine', 'shift')
+
+    def __str__(self):
+        return f'{self.machine.name} {self.shift} 产能 {self.capacity}'
+
 
 class Order(models.Model):
     """生产订单"""
@@ -189,7 +221,7 @@ class Schedule(models.Model):
     order = models.ForeignKey(Order, verbose_name='订单', on_delete=models.CASCADE, related_name='schedules')
     machine = models.ForeignKey(Machine, verbose_name='机台', on_delete=models.PROTECT, related_name='schedules')
     planned_date = models.DateField('计划日期')
-    shift = models.CharField('班次', max_length=10, default='白班')
+    shift = models.CharField('班次', max_length=10, choices=MachineShiftCapacity.Shift.choices, default='白班')
     planned_qty = models.PositiveIntegerField('计划产量(份)', default=0)
     actual_qty = models.PositiveIntegerField('实际产量(份)', default=0)
     done = models.BooleanField('是否完成', default=False)
@@ -202,6 +234,70 @@ class Schedule(models.Model):
 
     def __str__(self):
         return f'{self.planned_date} {self.machine} - {self.order.order_no}'
+
+
+def check_schedule_conflict(machine, planned_date, shift, planned_qty, exclude_id=None):
+    """
+    检查某机台某天某班次的排产冲突。
+
+    返回 dict：
+      capacity        该班次登记产能（未登记为 None）
+      existing_total  已排任务计划产量合计（不含 exclude_id）
+      tasks           已排任务列表（不含 exclude_id）
+      blocked         是否禁止保存：未登记产能 / 已有任务（撞班）/ 合计超产能
+      reason          blocked 时的原因码：no_capacity / occupied / over_capacity
+      message         中文提示
+      remain          该班次剩余可排产能（未登记为 None）
+    """
+    qs = Schedule.objects.filter(
+        machine=machine, planned_date=planned_date, shift=shift
+    ).select_related('order')
+    if exclude_id:
+        qs = qs.exclude(pk=exclude_id)
+    tasks = list(qs.order_by('id'))
+    existing_total = sum(t.planned_qty for t in tasks)
+
+    task_data = [{
+        'id': t.id,
+        'order': t.order_id,
+        'order_no': t.order.order_no,
+        'product_name': t.order.product_name,
+        'planned_qty': t.planned_qty,
+        'actual_qty': t.actual_qty,
+        'done': t.done,
+    } for t in tasks]
+
+    capacity = machine.shift_capacity(shift)
+    remain = None if capacity is None else capacity - existing_total
+    blocked = False
+    reason = None
+    message = ''
+
+    if capacity is None:
+        blocked, reason = True, 'no_capacity'
+        message = f'机台「{machine.name}」未登记 {planned_date} {shift} 的班次产能，请先在机台管理中登记产能'
+    elif tasks:
+        blocked, reason = True, 'occupied'
+        message = (
+            f'{machine.name} {planned_date} {shift}已有 {len(tasks)} 个排产任务，'
+            f'已排计划 {existing_total} 份，同机台同班次不能重复排产'
+        )
+    elif planned_qty > capacity:
+        blocked, reason = True, 'over_capacity'
+        message = (
+            f'{machine.name} {shift}班次产能为 {capacity} 份，'
+            f'本次计划 {planned_qty} 份，超出 {planned_qty - capacity} 份'
+        )
+
+    return {
+        'capacity': capacity,
+        'existing_total': existing_total,
+        'remain': remain,
+        'tasks': task_data,
+        'blocked': blocked,
+        'reason': reason,
+        'message': message,
+    }
 
 
 class ReworkRecord(models.Model):

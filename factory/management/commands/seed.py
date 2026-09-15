@@ -6,6 +6,7 @@ from django.db import transaction
 from factory.models import (
     Customer,
     Machine,
+    MachineShiftCapacity,
     Order,
     Paper,
     PaperTransaction,
@@ -60,13 +61,20 @@ class Command(BaseCommand):
             papers[spec] = p
 
         # ---------------- 机台 ----------------
-        machines = [
-            Machine.objects.create(name='海德堡CD102-1号机', machine_type='对开四色胶印机', status='running'),
-            Machine.objects.create(name='海德堡SM52-2号机', machine_type='四开四色胶印机', status='running'),
-            Machine.objects.create(name='小森LS440-3号机', machine_type='对开四色胶印机', status='idle'),
-            Machine.objects.create(name='罗兰700-4号机', machine_type='对开五色胶印机', status='maintenance'),
-            Machine.objects.create(name='马天尼胶订线', machine_type='全自动胶装联动线', status='running'),
+        # (名称, 机型, 状态, 白班产能, 夜班产能)
+        machines_spec = [
+            ('海德堡CD102-1号机', '对开四色胶印机', 'running', 12000, 10000),
+            ('海德堡SM52-2号机', '四开四色胶印机', 'running', 10000, 8000),
+            ('小森LS440-3号机', '对开四色胶印机', 'idle', 12000, 10000),
+            ('罗兰700-4号机', '对开五色胶印机', 'maintenance', 12000, 10000),
+            ('马天尼胶订线', '全自动胶装联动线', 'running', 15000, 12000),
         ]
+        machines = []
+        for name, mtype, status, day_cap, night_cap in machines_spec:
+            m = Machine.objects.create(name=name, machine_type=mtype, status=status)
+            MachineShiftCapacity.objects.create(machine=m, shift='白班', capacity=day_cap)
+            MachineShiftCapacity.objects.create(machine=m, shift='夜班', capacity=night_cap)
+            machines.append(m)
 
         # ---------------- 订单 ----------------
         # (编号, 客户idx, 产品, 数量, 纸张spec, 用纸量, 状态, 下单偏移, 交期偏移)

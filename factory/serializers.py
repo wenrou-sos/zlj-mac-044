@@ -1,16 +1,36 @@
 from rest_framework import serializers
+from rest_framework.exceptions import APIException
 
 from .models import (
     today as _today,
     Customer,
     Machine,
+    MachineShiftCapacity,
     Order,
     Paper,
     PaperTransaction,
     ProcessProgress,
     ReworkRecord,
     Schedule,
+    check_schedule_conflict,
 )
+
+
+class ScheduleConflict(APIException):
+    """排产冲突：400 且携带结构化冲突任务列表"""
+
+    status_code = 400
+    default_detail = '排产冲突'
+    default_code = 'schedule_conflict'
+
+    def __init__(self, result):
+        self.detail = {
+            'detail': result['message'],
+            'reason': result['reason'],
+            'capacity': result['capacity'],
+            'existing_total': result['existing_total'],
+            'conflicts': result['tasks'],
+        }
 
 
 class CustomerSerializer(serializers.ModelSerializer):
@@ -28,12 +48,58 @@ class PaperSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+class MachineShiftCapacitySerializer(serializers.ModelSerializer):
+    shift_display = serializers.CharField(source='get_shift_display', read_only=True)
+
+    class Meta:
+        model = MachineShiftCapacity
+        fields = ['id', 'shift', 'shift_display', 'capacity']
+
+
 class MachineSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    shift_capacities = MachineShiftCapacitySerializer(many=True, read_only=True)
+    # 写入用：[{"shift": "白班", "capacity": 12000}, ...]
+    capacities = serializers.ListField(
+        child=serializers.DictField(), write_only=True, required=False)
 
     class Meta:
         model = Machine
         fields = '__all__'
+
+    def validate_capacities(self, value):
+        for item in value:
+            shift = item.get('shift')
+            if shift not in dict(MachineShiftCapacity.Shift.choices):
+                raise serializers.ValidationError(f'班次「{shift}」不合法')
+            try:
+                cap = int(item.get('capacity'))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError('班次产能必须为非负整数')
+            if cap < 0:
+                raise serializers.ValidationError('班次产能不能为负数')
+            item['capacity'] = cap
+        return value
+
+    def _save_capacities(self, machine, capacities):
+        for item in capacities:
+            MachineShiftCapacity.objects.update_or_create(
+                machine=machine, shift=item['shift'],
+                defaults={'capacity': item['capacity']},
+            )
+
+    def create(self, validated_data):
+        capacities = validated_data.pop('capacities', [])
+        machine = super().create(validated_data)
+        self._save_capacities(machine, capacities)
+        return machine
+
+    def update(self, instance, validated_data):
+        capacities = validated_data.pop('capacities', None)
+        machine = super().update(instance, validated_data)
+        if capacities is not None:
+            self._save_capacities(machine, capacities)
+        return machine
 
 
 class ProcessProgressSerializer(serializers.ModelSerializer):
@@ -181,6 +247,27 @@ class ScheduleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Schedule
         fields = '__all__'
+
+    def validate(self, attrs):
+        # 仅在涉及 机台/日期/班次/计划量 的保存时做冲突校验；
+        # 只改完成状态、实际产量（标记完成等）不受影响
+        keys = ('machine', 'planned_date', 'shift', 'planned_qty')
+        if self.instance is None or any(k in attrs for k in keys):
+            machine = attrs.get('machine') or getattr(self.instance, 'machine', None)
+            planned_date = attrs.get('planned_date') or getattr(self.instance, 'planned_date', None)
+            shift = attrs.get('shift') or getattr(self.instance, 'shift', None)
+            planned_qty = attrs.get('planned_qty')
+            if planned_qty is None:
+                planned_qty = getattr(self.instance, 'planned_qty', 0)
+
+            result = check_schedule_conflict(
+                machine, planned_date, shift, planned_qty,
+                exclude_id=self.instance.id if self.instance else None,
+            )
+            if result['blocked']:
+                # conflicts 字段供前端把冲突任务逐条列出
+                raise ScheduleConflict(result)
+        return attrs
 
 
 class ReworkSerializer(serializers.ModelSerializer):

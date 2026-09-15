@@ -64,3 +64,8 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Helvetica Neue",
 
 .schedule-item { display:flex; align-items:flex-start; gap:8px; padding:8px 10px; margin-bottom:8px; border-radius:6px; background:#ecf5ff; border-left:3px solid #409eff; }
 .schedule-item.done { background:#f0f9eb; border-left-color:#67c23a; opacity:.85; }
+
+.shift-load { margin-bottom: 8px; }
+.shift-load.over { color: #f56c6c; font-weight: 600; }
+.conflict-tasks { margin-top: 2px; font-size: 13px; line-height: 1.7; }
+.conflict-task { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

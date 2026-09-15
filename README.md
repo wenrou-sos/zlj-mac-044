@@ -29,7 +29,7 @@ bash start.sh
 | 📊 生产看板 | 在制/逾期/返工/低库存统计卡；交期三级预警（逾期、≤2天紧急、≤5天预警）；近7日机台负荷图；订单状态分布、机台概况、低库存清单，全部可点击下钻 |
 | 📋 订单管理 | 订单新建/编辑/筛选（关键字、状态、客户、交期级别）；列表内嵌三工序流水线与进度条；详情抽屉维护工序进度、排产、返工 |
 | 📦 纸张材料 | 纸张库存、安全库存预警、库存金额；入库/出库（可关联订单）自动写出入库流水；出库超量拦截 |
-| 🏭 机台排产 | 按日期浏览各机台任务（日历式排产表）、班次、计划/实际产量与完成率；机台增删改与状态（生产中/空闲/维保）随排产自动联动 |
+| 🏭 机台排产 | 按日期浏览各机台任务（日历式排产表）、班次、计划/实际产量与完成率；**机台按班次（白班/夜班）登记产能**，排产时实时预检：同机台同日同班已有任务（撞班）、班次未登记产能、计划量超班次产能均会列出冲突任务并阻止保存，调整机台/日期/班次/计划量后提示自动刷新；机台增删改与状态（生产中/空闲/维保）随排产自动联动 |
 | 🔧 返工跟踪 | 返工单全生命周期：待处理 → 返工中 → 已闭环；记录工序、原因（色差/套印/划伤/装订/材料）、数量、责任人、问题描述与处理结果 |
 
 ### 工序与订单状态联动
@@ -48,11 +48,12 @@ bash start.sh
 | `GET /api/dashboard/` | 看板汇总（统计、预警订单、低库存、7日负荷） |
 | `GET/POST /api/orders/`、`PATCH /api/orders/{id}/` | 订单 |
 | `GET/PATCH /api/orders/{id}/progress/` | 三工序进度（服务端校验 0–100 与状态一致性） |
-| `GET/POST /api/schedules/`、`PATCH /api/schedules/{id}/` | 机台排产 |
+| `GET/POST /api/schedules/`、`PATCH /api/schedules/{id}/` | 机台排产（撞班 / 未登记班次产能 / 计划量超产能返回 400 并列出冲突任务） |
+| `GET /api/schedules/conflicts/` | 排产冲突预检（参数 machine/date/shift/planned_qty/exclude，编辑排产时用 exclude 排除自身） |
 | `POST /api/papers/{id}/stock_in/`、`stock_out/` | 纸张出入库 |
 | `GET /api/paper-transactions/` | 出入库流水 |
 | `GET/POST /api/reworks/`、`PATCH /api/reworks/{id}/` | 返工单 |
-| `GET/POST /api/machines/`、`/api/customers/` | 机台、客户 |
+| `GET/POST /api/machines/`、`/api/customers/` | 机台（`capacities: [{shift, capacity}]` 维护各班次产能）、客户 |
 
 另可访问 Django Admin：`python manage.py createsuperuser` 后登录 <http://127.0.0.1:8000/admin/>。
 

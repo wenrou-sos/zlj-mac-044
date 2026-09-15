@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     Customer,
     Machine,
+    MachineShiftCapacity,
     Order,
     Paper,
     PaperTransaction,
@@ -25,10 +26,23 @@ class PaperAdmin(admin.ModelAdmin):
     search_fields = ('name', 'spec')
 
 
+class MachineShiftCapacityInline(admin.TabularInline):
+    model = MachineShiftCapacity
+    extra = 2
+
+
 @admin.register(Machine)
 class MachineAdmin(admin.ModelAdmin):
-    list_display = ('name', 'machine_type', 'status')
+    list_display = ('name', 'machine_type', 'status', 'capacity_summary')
     list_filter = ('status',)
+    inlines = [MachineShiftCapacityInline]
+
+    @admin.display(description='班次产能(白班/夜班)')
+    def capacity_summary(self, obj):
+        day = obj.shift_capacity('白班')
+        night = obj.shift_capacity('夜班')
+        fmt = lambda v: '未登记' if v is None else f'{v}份'
+        return f'{fmt(day)} / {fmt(night)}'
 
 
 class ProcessProgressInline(admin.StackedInline):

@@ -26,6 +26,7 @@ const STAGES = [
 ];
 const PAPER_TYPES = { coated: '铜版纸', offset: '胶版纸', whiteboard: '白卡纸', kraft: '牛皮纸', special: '特种纸' };
 const MACHINE_STATUS = { running: { label: '生产中', type: 'success' }, idle: { label: '空闲', type: 'info' }, maintenance: { label: '维保中', type: 'warning' } };
+const SHIFT_OPTIONS = [{ value: '白班', label: '白班' }, { value: '夜班', label: '夜班' }];
 const REWORK_STATUS = { open: { label: '待处理', type: 'danger' }, processing: { label: '返工中', type: 'warning' }, closed: { label: '已闭环', type: 'success' } };
 const REWORK_REASONS = { color: '色差', register: '套印不准', scratch: '划伤/脏点', binding: '装订错误', material: '材料问题', other: '其他' };
 const WARNING_LEVEL = {
@@ -46,12 +47,16 @@ async function api(method, url, body) {
     const res = await fetch('/api' + url, opt);
     if (!res.ok) {
         let msg = `请求失败 (${res.status})`;
+        let payload = null;
         try {
             const data = await res.json();
+            payload = data;
             if (data.detail) msg = data.detail;
             else msg = Object.entries(data).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join('；') : v}`).join('；');
         } catch (e) { /* ignore */ }
-        throw new Error(msg);
+        const err = new Error(msg);
+        err.payload = payload;
+        throw err;
     }
     if (res.status === 204) return null;
     return res.json();
@@ -66,6 +71,27 @@ const apiDel = (url) => api('DELETE', url);
 function todayStr() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function debounce(fn, wait) {
+    let timer = null;
+    return function (...args) {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn.apply(this, args), wait);
+    };
+}
+
+/**
+ * 排产冲突预检：返回后端检查结果（blocked / reason / capacity / tasks ...）。
+ * 机台、日期、班次不齐时不请求，返回 null。
+ */
+async function fetchScheduleConflict({ machine, planned_date, shift, planned_qty = 0, exclude = null }) {
+    if (!machine || !planned_date || !shift) return null;
+    const params = new URLSearchParams({
+        machine, date: planned_date, shift, planned_qty: planned_qty || 0,
+    });
+    if (exclude) params.set('exclude', exclude);
+    return apiGet('/schedules/conflicts/?' + params.toString());
 }
 
 /* ============================================================
@@ -492,8 +518,7 @@ const Orders = {
             <el-col :span="12">
               <el-form-item label="班次">
                 <el-select v-model="sform.shift" style="width:100%">
-                  <el-option label="白班" value="白班"></el-option>
-                  <el-option label="夜班" value="夜班"></el-option>
+                  <el-option v-for="sh in SHIFT_OPTIONS" :key="sh.value" :label="sh.label" :value="sh.value"></el-option>
                 </el-select>
               </el-form-item>
             </el-col>
@@ -510,13 +535,31 @@ const Orders = {
               </el-form-item>
             </el-col>
           </el-row>
+
+          <!-- 班次冲突实时提示 -->
+          <el-alert v-if="sConflict" :type="sConflict.blocked ? 'error' : 'success'" :closable="false"
+                    show-icon style="margin: 0 0 14px 0">
+            <template #title>
+              <div>{{ sConflictTip }}</div>
+            </template>
+            <template v-if="sConflict.blocked && sConflict.tasks.length" #default>
+              <div class="conflict-tasks">
+                <div style="margin:4px 0">冲突任务：</div>
+                <div v-for="t in sConflict.tasks" :key="t.id" class="conflict-task">
+                  · {{ t.order_no }} {{ t.product_name }}，计划 {{ formatNum(t.planned_qty) }} 份
+                  <el-tag v-if="t.done" size="small" type="success" effect="plain" style="margin-left:4px">已完成</el-tag>
+                </div>
+              </div>
+            </template>
+          </el-alert>
+
           <el-form-item label="备注">
             <el-input v-model="sform.remark" placeholder="如：专色印刷 / 待纸"></el-input>
           </el-form-item>
         </el-form>
         <template #footer>
           <el-button @click="schedDialog=false">取消</el-button>
-          <el-button type="primary" @click="saveSchedule">保存</el-button>
+          <el-button type="primary" :disabled="!!(sConflict && sConflict.blocked)" :loading="sConflictLoading" @click="saveSchedule">保存</el-button>
         </template>
       </el-dialog>
 
@@ -580,6 +623,9 @@ const Orders = {
 
         const schedDialog = ref(false);
         const sform = reactive({ machine: null, planned_date: todayStr(), shift: '白班', planned_qty: 0, actual_qty: 0, remark: '' });
+        const sConflict = ref(null);
+        const sConflictLoading = ref(false);
+        let sConflictSeq = 0;
 
         const reworkDialog = ref(false);
         const rform = reactive({ stage: 'printing', reason: 'color', qty: 100, handler: '', found_at: todayStr(), description: '' });
@@ -695,18 +741,66 @@ const Orders = {
             } catch (e) { ElMessage.error(e.message); }
         }
 
+        const sConflictTip = computed(() => {
+            const c = sConflict.value;
+            if (!c) return '';
+            if (c.reason === 'no_capacity') return c.message;
+            if (c.reason === 'occupied') {
+                return `${c.message}；该班次剩余产能 ${formatNum(c.remain)} 份，请调整日期或班次`;
+            }
+            if (c.reason === 'over_capacity') return c.message;
+            return `${c.machine_name} ${c.date} ${c.shift}无冲突：班次产能 ${formatNum(c.capacity)} 份，本次后排产合计 ${formatNum(c.existing_total + c.planned_qty)} 份，剩余 ${formatNum(c.capacity - c.existing_total - c.planned_qty)} 份`;
+        });
+
+        async function reloadSConflict() {
+            if (!schedDialog.value) return;
+            if (!sform.machine || !sform.planned_date || !sform.shift) { sConflict.value = null; return; }
+            const seq = ++sConflictSeq;
+            sConflictLoading.value = true;
+            try {
+                const data = await fetchScheduleConflict({
+                    machine: sform.machine, planned_date: sform.planned_date, shift: sform.shift,
+                    planned_qty: sform.planned_qty,
+                });
+                if (seq === sConflictSeq) sConflict.value = data;
+            } catch (e) {
+                if (seq === sConflictSeq) sConflict.value = null;
+            } finally {
+                if (seq === sConflictSeq) sConflictLoading.value = false;
+            }
+        }
+        const reloadSConflictDebounced = debounce(reloadSConflict, 250);
+
         function openSchedule() {
             Object.assign(sform, { machine: machines.value[0]?.id || null, planned_date: todayStr(), shift: '白班', planned_qty: detail.value.quantity, actual_qty: 0, remark: '' });
+            sConflict.value = null;
             schedDialog.value = true;
+            reloadSConflict();
         }
+        // 调整机台 / 日期 / 班次 / 计划量后冲突提示跟着更新
+        watch(() => [sform.machine, sform.planned_date, sform.shift, sform.planned_qty],
+            () => { if (schedDialog.value) reloadSConflictDebounced(); });
+
         async function saveSchedule() {
             if (!sform.machine) { ElMessage.warning('请选择机台'); return; }
+            const live = await fetchScheduleConflict({
+                machine: sform.machine, planned_date: sform.planned_date, shift: sform.shift,
+                planned_qty: sform.planned_qty,
+            });
+            sConflict.value = live;
+            if (live && live.blocked) {
+                ElMessage.error(live.message);
+                return;
+            }
             try {
                 await apiPost('/schedules/', { order: detail.value.id, ...sform });
                 ElMessage.success('排产已添加');
                 schedDialog.value = false;
                 await refreshDetail();
-            } catch (e) { ElMessage.error(e.message); }
+            } catch (e) {
+                if (e.payload?.conflicts) sConflict.value = { ...live, ...e.payload };
+                ElMessage.error(e.message);
+            }
         }
         async function toggleSchedule(row) {
             try {
@@ -750,6 +844,7 @@ const Orders = {
             loading, orders, customers, papers, machines, filters,
             formVisible, editing, form, detailVisible, detail,
             progressDialog, pform, schedDialog, sform, reworkDialog, rform,
+            sConflict, sConflictLoading, sConflictTip, SHIFT_OPTIONS,
             ORDER_STATUS, STAGE_STATUS, STAGES, REWORK_STATUS, REWORK_REASONS, WARNING_LEVEL,
             formatNum, stageClass, activeStage, progressStatus, canMarkDone,
             load, reset, openCreate, openEdit, saveOrder, openDetail,
@@ -1021,11 +1116,23 @@ const Schedules = {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="当日负荷" width="200">
+          <el-table-column label="当日班次负荷" width="220">
             <template #default="{ row }">
-              <div>计划 {{ formatNum(row.planTotal) }} 份</div>
-              <el-progress :percentage="row.planTotal ? Math.round(row.actualTotal / row.planTotal * 100) : 0"
-                           :status="row.actualTotal >= row.planTotal && row.planTotal ? 'success' : ''" style="margin-top:4px"></el-progress>
+              <div v-for="sh in SHIFT_OPTIONS" :key="sh.value" class="shift-load"
+                   :class="{ over: isShiftOver(row, sh.value) }">
+                <div>
+                  <el-tag size="small" :type="sh.value==='夜班' ? 'info' : 'warning'" effect="plain" style="margin-right:4px">{{ sh.label }}</el-tag>
+                  {{ formatNum(shiftTotal(row, sh.value)) }}
+                  <template v-if="shiftCapacity(row, sh.value) !== null">
+                    / {{ formatNum(shiftCapacity(row, sh.value)) }} 份
+                  </template>
+                  <template v-else><el-tag size="small" type="danger" effect="plain">未登记产能</el-tag></template>
+                </div>
+                <el-progress v-if="shiftCapacity(row, sh.value)"
+                             :percentage="shiftPct(row, sh.value)"
+                             :status="isShiftOver(row, sh.value) ? 'exception' : 'success'"
+                             :show-text="false" style="margin-top:2px"></el-progress>
+              </div>
             </template>
           </el-table-column>
         </el-table>
@@ -1054,8 +1161,7 @@ const Schedules = {
             <el-col :span="12">
               <el-form-item label="班次">
                 <el-select v-model="form.shift" style="width:100%">
-                  <el-option label="白班" value="白班"></el-option>
-                  <el-option label="夜班" value="夜班"></el-option>
+                  <el-option v-for="sh in SHIFT_OPTIONS" :key="sh.value" :label="sh.label" :value="sh.value"></el-option>
                 </el-select>
               </el-form-item>
             </el-col>
@@ -1072,12 +1178,30 @@ const Schedules = {
               </el-form-item>
             </el-col>
           </el-row>
+
+          <!-- 班次冲突实时提示 -->
+          <el-alert v-if="conflict" :type="conflict.blocked ? 'error' : 'success'" :closable="false"
+                    show-icon style="margin: 0 0 14px 0">
+            <template #title>
+              <div>{{ conflictTip }}</div>
+            </template>
+            <template v-if="conflict.blocked && conflict.tasks.length" #default>
+              <div class="conflict-tasks">
+                <div style="margin:4px 0">冲突任务：</div>
+                <div v-for="t in conflict.tasks" :key="t.id" class="conflict-task">
+                  · {{ t.order_no }} {{ t.product_name }}，计划 {{ formatNum(t.planned_qty) }} 份
+                  <el-tag v-if="t.done" size="small" type="success" effect="plain" style="margin-left:4px">已完成</el-tag>
+                </div>
+              </div>
+            </template>
+          </el-alert>
+
           <el-form-item label="备注"><el-input v-model="form.remark" placeholder="如：专色 / 覆膜后加工"></el-input></el-form-item>
         </el-form>
         <template #footer>
           <el-button v-if="editing" type="danger" @click="remove">删除</el-button>
           <el-button @click="formVisible=false">取消</el-button>
-          <el-button type="primary" @click="save">保存</el-button>
+          <el-button type="primary" :disabled="!!(conflict && conflict.blocked)" :loading="conflictLoading" @click="save">保存</el-button>
         </template>
       </el-dialog>
 
@@ -1085,8 +1209,14 @@ const Schedules = {
       <el-dialog v-model="mDialog" title="机台管理" width="560px">
         <el-button type="primary" size="small" style="margin-bottom:10px" @click="openMachine(null)">+ 新增机台</el-button>
         <el-table :data="machines" border size="small">
-          <el-table-column prop="name" label="机台名称" min-width="170"></el-table-column>
-          <el-table-column prop="machine_type" label="机型" min-width="150"></el-table-column>
+          <el-table-column prop="name" label="机台名称" min-width="150"></el-table-column>
+          <el-table-column prop="machine_type" label="机型" min-width="130"></el-table-column>
+          <el-table-column label="白班产能" width="90">
+            <template #default="{ row }">{{ capText(row, '白班') }}</template>
+          </el-table-column>
+          <el-table-column label="夜班产能" width="90">
+            <template #default="{ row }">{{ capText(row, '夜班') }}</template>
+          </el-table-column>
           <el-table-column label="状态" width="100">
             <template #default="{ row }">
               <el-select v-model="row.status" size="small" @change="changeMachineStatus(row)">
@@ -1111,6 +1241,9 @@ const Schedules = {
               <el-option v-for="(s, k) in MACHINE_STATUS" :key="k" :label="s.label" :value="k"></el-option>
             </el-select>
           </el-form-item>
+          <el-form-item v-for="sh in SHIFT_OPTIONS" :key="sh.value" :label="sh.label + '产能'">
+            <el-input-number v-model="mform.capacities[sh.value]" :min="0" :step="1000" style="width:100%"></el-input-number>
+          </el-form-item>
         </el-form>
         <template #footer>
           <el-button @click="mFormVisible=false">取消</el-button>
@@ -1132,9 +1265,46 @@ const Schedules = {
         const mDialog = ref(false);
         const mFormVisible = ref(false);
         const mEditing = ref(null);
-        const mform = reactive({ name: '', machine_type: '', status: 'idle' });
+        const mform = reactive({ name: '', machine_type: '', status: 'idle', capacities: { '白班': 10000, '夜班': 10000 } });
+
+        // 排产冲突预检结果
+        const conflict = ref(null);
+        const conflictLoading = ref(false);
+        let conflictSeq = 0;
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
+
+        function shiftCapacity(machine, shift) {
+            const cap = (machine.shift_capacities || []).find(c => c.shift === shift);
+            return cap ? cap.capacity : null;
+        }
+        function capText(row, shift) {
+            const cap = shiftCapacity(row, shift);
+            return cap === null ? '—' : formatNum(cap);
+        }
+        function shiftTotal(row, shift) {
+            return row.items.filter(i => i.shift === shift).reduce((a, i) => a + Number(i.planned_qty), 0);
+        }
+        function shiftPct(row, shift) {
+            const cap = shiftCapacity(row, shift);
+            if (!cap) return 0;
+            return Math.min(100, Math.round(shiftTotal(row, shift) / cap * 100));
+        }
+        function isShiftOver(row, shift) {
+            const cap = shiftCapacity(row, shift);
+            return cap !== null && shiftTotal(row, shift) > cap;
+        }
+
+        const conflictTip = computed(() => {
+            const c = conflict.value;
+            if (!c) return '';
+            if (c.reason === 'no_capacity') return c.message;
+            if (c.reason === 'occupied') {
+                return `${c.message}；该班次剩余产能 ${formatNum(c.remain)} 份，请调整日期或班次`;
+            }
+            if (c.reason === 'over_capacity') return c.message;
+            return `${c.machine_name} ${c.date} ${c.shift}无冲突：已排 ${formatNum(c.existing_total)} 份，班次产能 ${formatNum(c.capacity)} 份，本次后剩余 ${formatNum(c.capacity - c.existing_total - c.planned_qty)} 份`;
+        });
 
         const machineRows = computed(() => machines.value.map(m => {
             const items = schedules.value.filter(s => s.machine === m.id);
@@ -1162,6 +1332,25 @@ const Schedules = {
             loadSchedules();
         }
 
+        async function reloadConflict() {
+            if (!formVisible.value) return;
+            if (!form.machine || !form.planned_date || !form.shift) { conflict.value = null; return; }
+            const seq = ++conflictSeq;
+            conflictLoading.value = true;
+            try {
+                const data = await fetchScheduleConflict({
+                    machine: form.machine, planned_date: form.planned_date, shift: form.shift,
+                    planned_qty: form.planned_qty, exclude: editing.value?.id,
+                });
+                if (seq === conflictSeq) conflict.value = data;
+            } catch (e) {
+                if (seq === conflictSeq) conflict.value = null;
+            } finally {
+                if (seq === conflictSeq) conflictLoading.value = false;
+            }
+        }
+        const reloadConflictDebounced = debounce(reloadConflict, 250);
+
         function openCreate(item) {
             editing.value = item || null;
             if (item) Object.assign(form, {
@@ -1174,17 +1363,37 @@ const Schedules = {
                 planned_date: curDate.value, shift: '白班', planned_qty: 0, actual_qty: 0,
                 remark: '', done: false,
             });
+            conflict.value = null;
             formVisible.value = true;
+            reloadConflict();
         }
+
+        // 调整机台 / 日期 / 班次 / 计划量后冲突提示跟着更新
+        watch(() => [form.machine, form.planned_date, form.shift, form.planned_qty],
+            () => { if (formVisible.value) reloadConflictDebounced(); });
+
         async function save() {
             if (!form.machine || !form.order) { ElMessage.warning('请选择机台和订单'); return; }
+            // 保存前再实时校验一次，避免防抖未完成时漏判
+            const live = await fetchScheduleConflict({
+                machine: form.machine, planned_date: form.planned_date, shift: form.shift,
+                planned_qty: form.planned_qty, exclude: editing.value?.id,
+            });
+            conflict.value = live;
+            if (live && live.blocked) {
+                ElMessage.error(live.message);
+                return;
+            }
             try {
                 if (editing.value) await apiPatch('/schedules/' + editing.value.id + '/', { ...form });
                 else await apiPost('/schedules/', { ...form });
                 ElMessage.success('已保存，机台状态已同步');
                 formVisible.value = false;
                 load();
-            } catch (e) { ElMessage.error(e.message); }
+            } catch (e) {
+                if (e.payload?.conflicts) conflict.value = { ...live, ...e.payload };
+                ElMessage.error(e.message);
+            }
         }
         async function remove() {
             try {
@@ -1209,15 +1418,24 @@ const Schedules = {
         }
         function openMachine(row) {
             mEditing.value = row;
-            if (row) Object.assign(mform, { name: row.name, machine_type: row.machine_type, status: row.status });
-            else Object.assign(mform, { name: '', machine_type: '', status: 'idle' });
+            const caps = { '白班': 10000, '夜班': 10000 };
+            if (row) {
+                (row.shift_capacities || []).forEach(c => { caps[c.shift] = c.capacity; });
+                Object.assign(mform, { name: row.name, machine_type: row.machine_type, status: row.status, capacities: caps });
+            } else {
+                Object.assign(mform, { name: '', machine_type: '', status: 'idle', capacities: caps });
+            }
             mFormVisible.value = true;
         }
         async function saveMachine() {
             if (!mform.name) { ElMessage.warning('请输入名称'); return; }
+            const payload = {
+                name: mform.name, machine_type: mform.machine_type, status: mform.status,
+                capacities: SHIFT_OPTIONS.map(sh => ({ shift: sh.value, capacity: mform.capacities[sh.value] || 0 })),
+            };
             try {
-                if (mEditing.value) await apiPatch('/machines/' + mEditing.value.id + '/', { ...mform });
-                else await apiPost('/machines/', { ...mform });
+                if (mEditing.value) await apiPatch('/machines/' + mEditing.value.id + '/', payload);
+                else await apiPost('/machines/', payload);
                 ElMessage.success('已保存');
                 mFormVisible.value = false;
                 loadMachines();
@@ -1228,7 +1446,9 @@ const Schedules = {
         return {
             loading, machines, schedules, activeOrders, curDate, machineRows,
             formVisible, editing, form, mDialog, mFormVisible, mEditing, mform,
-            MACHINE_STATUS, formatNum, todayStr,
+            MACHINE_STATUS, SHIFT_OPTIONS, formatNum, todayStr,
+            conflict, conflictLoading, conflictTip,
+            shiftCapacity, capText, shiftTotal, shiftPct, isShiftOver,
             loadSchedules, shiftDay, openCreate, save, remove, toggleDone,
             changeMachineStatus, openMachine, saveMachine,
         };
