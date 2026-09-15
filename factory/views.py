@@ -2,6 +2,7 @@ from datetime import date as date_cls
 
 from django.db import transaction
 from django.db.models import Count, Sum
+from django.db.models.functions import Trim
 from .models import today
 from rest_framework import viewsets
 from rest_framework.response import Response
@@ -241,7 +242,8 @@ class ShiftHandoverViewSet(viewsets.ModelViewSet):
         if machine_id:
             qs = qs.filter(machine_id=machine_id)
         if request.query_params.get('abnormal') == '1':
-            qs = qs.exclude(abnormal_note='')
+            # 异常判定统一按去掉首尾空白后的内容
+            qs = qs.annotate(_abn=Trim('abnormal_note')).exclude(_abn='')
         return Response(self.get_serializer(qs, many=True).data)
 
     @staticmethod
@@ -254,11 +256,18 @@ class ShiftHandoverViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             return None
 
+    def perform_create(self, serializer):
+        """手动补录：标记来源，重新生成时不会被自动同步/清理"""
+        serializer.save(source=ShiftHandover.Source.MANUAL)
+
     @action(detail=False, methods=['post'])
     def generate(self, request):
         """按日期（可指定班次）从排产汇总生成交接记录。
 
-        已存在的记录只刷新计划/实际产量，保留值班人填写的异常说明与交接事项。
+        - 已存在的记录只刷新计划/实际产量，保留值班人填写的内容；
+        - 排产已删除或改期的自动记录：无填写内容的直接清理，
+          有填写内容的产量清零并保留（在响应中列出），保证与看板口径一致；
+        - 手动补录的记录不受影响。
         """
         work_date = self._parse_date(request.data.get('date'))
         if not work_date:
@@ -271,15 +280,44 @@ class ShiftHandoverViewSet(viewsets.ModelViewSet):
         agg = (schedules.values('machine_id', 'shift')
                .annotate(plan=Sum('planned_qty'), act=Sum('actual_qty')))
 
-        created = updated = 0
+        created = updated = cleaned = 0
+        zeroed = []
         with transaction.atomic():
+            synced_keys = set()
             for row in agg:
+                synced_keys.add((row['machine_id'], row['shift']))
                 _, was_created = ShiftHandover.objects.update_or_create(
                     machine_id=row['machine_id'], work_date=work_date, shift=row['shift'],
-                    defaults={'planned_qty': row['plan'], 'actual_qty': row['act']},
+                    defaults={
+                        'planned_qty': row['plan'],
+                        'actual_qty': row['act'],
+                        'source': ShiftHandover.Source.AUTO,
+                    },
                 )
                 created += 1 if was_created else 0
                 updated += 0 if was_created else 1
+
+            # 同步/清理失效记录：排产已删除或改期的自动生成记录
+            stale_qs = ShiftHandover.objects.filter(
+                work_date=work_date, source=ShiftHandover.Source.AUTO)
+            if shift:
+                stale_qs = stale_qs.filter(shift=shift)
+            for rec in stale_qs.select_related('machine'):
+                if (rec.machine_id, rec.shift) in synced_keys:
+                    continue
+                has_content = rec.abnormal_note.strip() or rec.handover_note.strip() \
+                    or rec.duty_officer.strip()
+                if not has_content:
+                    # 无人工填写内容：直接清理
+                    rec.delete()
+                    cleaned += 1
+                elif rec.planned_qty or rec.actual_qty:
+                    # 值班人已填内容：产量清零、内容保留，交由人工确认去留
+                    rec.planned_qty = 0
+                    rec.actual_qty = 0
+                    rec.save(update_fields=['planned_qty', 'actual_qty', 'updated_at'])
+                    zeroed.append(f'{rec.machine.name}（{rec.shift}）')
+                # 有内容但产量已为 0（上次已清零）：保留，不再重复报告
 
         records = self.get_queryset().filter(work_date=work_date)
         if shift:
@@ -287,6 +325,9 @@ class ShiftHandoverViewSet(viewsets.ModelViewSet):
         return Response({
             'created': created,
             'updated': updated,
+            'cleaned': cleaned,
+            'zeroed': len(zeroed),
+            'zeroed_names': zeroed,
             'records': self.get_serializer(records, many=True).data,
         })
 
@@ -309,13 +350,15 @@ class ShiftHandoverViewSet(viewsets.ModelViewSet):
 
         total_plan = sum(s['planned'] for s in shifts)
         total_act = sum(s['actual'] for s in shifts)
+        # 异常判定统一按去掉首尾空白后的内容
+        abnormal_count = qs.annotate(_abn=Trim('abnormal_note')).exclude(_abn='').count()
         return Response({
             'date': work_date,
             'planned': total_plan,
             'actual': total_act,
             'rate': round(total_act / total_plan * 100, 1) if total_plan else None,
             'record_count': qs.count(),
-            'abnormal_count': qs.exclude(abnormal_note='').count(),
+            'abnormal_count': abnormal_count,
             'shifts': shifts,
         })
 

@@ -196,6 +196,14 @@ class Command(BaseCommand):
                 planned_qty=plan, actual_qty=actual, duty_officer=officer,
                 abnormal_note=abnormal, handover_note=note,
             )
+        # 手动补录：3号机无排产，故障停机交接（重新生成时不会被清理）
+        ShiftHandover.objects.create(
+            machine=machines[2], work_date=today, shift='白班',
+            planned_qty=0, actual_qty=0, duty_officer='李班长',
+            abnormal_note='靠版墨辊磨损异响，机修确认需更换配件，本班停机未排产。',
+            handover_note='配件预计明天到厂，到件后联系机修更换；夜班暂不排产。',
+            source='manual',
+        )
 
         # ---------------- 返工单 ----------------
         rw1 = ReworkRecord.objects.create(
@@ -237,5 +245,5 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f'样例数据生成完成：客户 {customers.__len__()} 家、纸张 {len(papers_data)} 种、'
             f'机台 {len(machines)} 台、订单 {len(orders_spec)} 个、'
-            f'排产 {len(schedules)} 条、交接班记录 {len(handovers)} 条、返工单 2 张'
+            f'排产 {len(schedules)} 条、交接班记录 {ShiftHandover.objects.count()} 条、返工单 2 张'
         ))

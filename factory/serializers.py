@@ -245,7 +245,7 @@ class ShiftHandoverSerializer(serializers.ModelSerializer):
     class Meta:
         model = ShiftHandover
         fields = '__all__'
-        read_only_fields = ['created_at', 'updated_at']
+        read_only_fields = ['created_at', 'updated_at', 'source']
         validators = []  # 唯一性在 validate() 中给出中文提示
 
     def get_completion_rate(self, obj):

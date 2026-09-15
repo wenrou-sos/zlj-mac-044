@@ -1512,7 +1512,9 @@ const Handovers = {
                   empty-text="该日期暂无交接记录，点击右上角「生成交接记录」自动汇总当班各机台产量">
           <el-table-column label="机台" min-width="180">
             <template #default="{ row }">
-              <div style="font-weight:600">{{ row.machine_name }}</div>
+              <div style="font-weight:600">{{ row.machine_name }}
+                <el-tag v-if="row.source==='manual'" size="small" type="info" effect="plain" style="margin-left:4px">补录</el-tag>
+              </div>
               <div class="muted">{{ row.machine_type }}</div>
             </template>
           </el-table-column>
@@ -1538,7 +1540,7 @@ const Handovers = {
           </el-table-column>
           <el-table-column label="异常说明" min-width="210">
             <template #default="{ row }">
-              <span v-if="row.abnormal_note" style="color:#f56c6c">{{ row.abnormal_note }}</span>
+              <span v-if="row.has_abnormal" style="color:#f56c6c">{{ row.abnormal_note }}</span>
               <span v-else class="muted">无异常</span>
             </template>
           </el-table-column>
@@ -1671,7 +1673,7 @@ const Handovers = {
             const shiftText = shiftFilter.value || '全部班次';
             try {
                 await ElMessageBox.confirm(
-                    `将按 ${curDate.value} ${shiftText} 的排产数据汇总各机台计划/实际产量；已存在的记录只刷新产量，已填写的异常说明与交接事项会保留。`,
+                    `将按 ${curDate.value} ${shiftText} 的排产数据汇总各机台计划/实际产量；已存在的记录只刷新产量，已填写的异常说明与交接事项会保留；排产已删除或改期的记录将同步清理或清零（手动补录不受影响）。`,
                     '生成交接记录',
                     { confirmButtonText: '生成', cancelButtonText: '取消', type: 'info' },
                 );
@@ -1680,8 +1682,23 @@ const Handovers = {
                 const body = { date: curDate.value };
                 if (shiftFilter.value) body.shift = shiftFilter.value;
                 const res = await apiPost('/handovers/generate/', body);
-                if (!res.created && !res.updated) ElMessage.info('该日期班次暂无排产数据，未生成记录');
-                else ElMessage.success(`已生成 ${res.created} 条、刷新 ${res.updated} 条交接记录`);
+                const parts = [];
+                if (res.created) parts.push(`生成 ${res.created} 条`);
+                if (res.updated) parts.push(`刷新产量 ${res.updated} 条`);
+                if (res.cleaned) parts.push(`清理失效记录 ${res.cleaned} 条`);
+                if (res.zeroed) parts.push(`无排产记录清零 ${res.zeroed} 条`);
+                if (res.zeroed) {
+                    // 有失效记录被清零保留时，明确告知由人工确认去留
+                    ElMessageBox.alert(
+                        `${parts.join('，')}。<br><br>以下记录对应的排产已删除或改期，产量已按当前排产清零（值班人填写的内容已保留），确认无用后可手动删除：<br><b>${res.zeroed_names.join('<br>')}</b>`,
+                        '已按当前排产同步',
+                        { dangerouslyUseHTMLString: true, confirmButtonText: '知道了' },
+                    ).catch(() => {});
+                } else if (parts.length) {
+                    ElMessage.success(parts.join('，'));
+                } else {
+                    ElMessage.info('该日期班次暂无排产数据，未生成记录');
+                }
                 load();
             } catch (e) { ElMessage.error(e.message); }
         }

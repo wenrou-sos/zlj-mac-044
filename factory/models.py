@@ -244,6 +244,10 @@ class ReworkRecord(models.Model):
 class ShiftHandover(models.Model):
     """班次交接记录：同一机台同一天同一班次仅一条"""
 
+    class Source(models.TextChoices):
+        AUTO = 'auto', '自动生成'
+        MANUAL = 'manual', '手动补录'
+
     machine = models.ForeignKey(Machine, verbose_name='机台', on_delete=models.CASCADE, related_name='handovers')
     work_date = models.DateField('生产日期')
     shift = models.CharField('班次', max_length=10, default='白班')
@@ -252,6 +256,7 @@ class ShiftHandover(models.Model):
     abnormal_note = models.TextField('异常说明', blank=True)
     handover_note = models.TextField('交接事项', blank=True)
     duty_officer = models.CharField('值班人', max_length=50, blank=True)
+    source = models.CharField('来源', max_length=10, choices=Source.choices, default=Source.AUTO)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
     updated_at = models.DateTimeField('更新时间', auto_now=True)
 
@@ -263,6 +268,13 @@ class ShiftHandover(models.Model):
 
     def __str__(self):
         return f'{self.work_date} {self.shift} {self.machine}'
+
+    def save(self, *args, **kwargs):
+        # 统一去掉首尾空白：异常/交接是否填写以 stripped 内容为准
+        self.abnormal_note = (self.abnormal_note or '').strip()
+        self.handover_note = (self.handover_note or '').strip()
+        self.duty_officer = (self.duty_officer or '').strip()
+        super().save(*args, **kwargs)
 
     @property
     def completion_rate(self):
