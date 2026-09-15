@@ -29,12 +29,18 @@ def _daily_capacity():
     return count, count * MACHINE_DAILY_CAPACITY
 
 
+def _done_qty(schedules):
+    """已完工排产任务的产量：实际产量为准，未填实际按计划"""
+    return sum(s.actual_qty or s.planned_qty for s in schedules if s.done)
+
+
 def _unscheduled_qty(order, cur):
-    """订单在未来排产中尚未覆盖的数量"""
-    scheduled = (order.schedules
-                 .filter(planned_date__gte=cur, done=False)
-                 .aggregate(s=Sum('planned_qty'))['s'] or 0)
-    return max(0, order.quantity - scheduled)
+    """订单还需占用产能的数量：扣掉已完工产量与未来排产覆盖量"""
+    schedules = list(order.schedules.all())
+    done = _done_qty(schedules)
+    scheduled = sum(s.planned_qty for s in schedules
+                    if not s.done and s.planned_date >= cur)
+    return max(0, order.quantity - done - scheduled)
 
 
 def evaluate_due_date(*, customer_id, paper_id, quantity, paper_consumption,
@@ -58,18 +64,15 @@ def evaluate_due_date(*, customer_id, paper_id, quantity, paper_consumption,
         loads[row['planned_date']] += row['s']
     scheduled_load = sum(loads.values())
 
-    # ---- 本单自身排产：已完成产量 + 未来排产按日期累计，哪天够数哪天算完 ----
+    # ---- 本单自身排产：已完工产量 + 未来排产按日期累计，哪天够数哪天算完 ----
     done_qty = 0
     own_future = {}
     if exclude_order_id:
-        done_qty = (Schedule.objects
-                    .filter(order_id=exclude_order_id, done=True)
-                    .aggregate(s=Sum('planned_qty'))['s'] or 0)
-        for row in (Schedule.objects
-                    .filter(order_id=exclude_order_id,
-                            planned_date__gte=cur, done=False)
-                    .values('planned_date').annotate(s=Sum('planned_qty'))):
-            own_future[row['planned_date']] = row['s']
+        own_schedules = list(Schedule.objects.filter(order_id=exclude_order_id))
+        done_qty = _done_qty(own_schedules)
+        for s in own_schedules:
+            if not s.done and s.planned_date >= cur:
+                own_future[s.planned_date] = own_future.get(s.planned_date, 0) + s.planned_qty
 
     own_needed = max(0, quantity - done_qty)
     own_future_total = sum(own_future.values())
