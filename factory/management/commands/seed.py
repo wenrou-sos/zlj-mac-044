@@ -6,6 +6,7 @@ from django.db import transaction
 from factory.models import (
     Customer,
     Machine,
+    MaintenanceRecord,
     Order,
     Paper,
     PaperTransaction,
@@ -22,6 +23,7 @@ class Command(BaseCommand):
         # 清空业务数据（保留用户/权限）
         ReworkRecord.objects.all().delete()
         Schedule.objects.all().delete()
+        MaintenanceRecord.objects.all().delete()
         Order.objects.all().delete()
         PaperTransaction.objects.all().delete()
         Paper.objects.all().delete()
@@ -60,13 +62,36 @@ class Command(BaseCommand):
             papers[spec] = p
 
         # ---------------- 机台 ----------------
-        machines = [
-            Machine.objects.create(name='海德堡CD102-1号机', machine_type='对开四色胶印机', status='running'),
-            Machine.objects.create(name='海德堡SM52-2号机', machine_type='四开四色胶印机', status='running'),
-            Machine.objects.create(name='小森LS440-3号机', machine_type='对开四色胶印机', status='idle'),
-            Machine.objects.create(name='罗兰700-4号机', machine_type='对开五色胶印机', status='maintenance'),
-            Machine.objects.create(name='马天尼胶订线', machine_type='全自动胶装联动线', status='running'),
+        # (名称, 机型, 状态, 保养周期天, 距上次保养天数)
+        # 覆盖：正常 / 即将到期(≤3天) / 已超期 / 维保中 / 未设置周期
+        machines_data = [
+            ('海德堡CD102-1号机', '对开四色胶印机', 'running', 30, -10),
+            ('海德堡SM52-2号机', '四开四色胶印机', 'running', 30, -28),
+            ('小森LS440-3号机', '对开四色胶印机', 'idle', 15, -20),
+            ('罗兰700-4号机', '对开五色胶印机', 'maintenance', 30, -32),
+            ('马天尼胶订线', '全自动胶装联动线', 'running', None, None),
         ]
+        machines = []
+        for name, mtype, status, cycle, last_off in machines_data:
+            machines.append(Machine.objects.create(
+                name=name, machine_type=mtype, status=status,
+                maintenance_cycle_days=cycle,
+                last_maintenance_date=(today + timedelta(days=last_off)) if last_off is not None else None,
+            ))
+
+        # 部分机台补一条近期保养登记，演示保养历史
+        MaintenanceRecord.objects.create(
+            machine=machines[0], maintenance_date=today - timedelta(days=10),
+            operator='张师傅（领机）', note='更换墨辊胶条，清洗水路，例行周保',
+        )
+        MaintenanceRecord.objects.create(
+            machine=machines[1], maintenance_date=today - timedelta(days=28),
+            operator='李班长', note='检查橡皮布张力、补充润滑油',
+        )
+        MaintenanceRecord.objects.create(
+            machine=machines[3], maintenance_date=today - timedelta(days=32),
+            operator='设备科', note='按周期例行保养；运转异响待检修',
+        )
 
         # ---------------- 订单 ----------------
         # (编号, 客户idx, 产品, 数量, 纸张spec, 用纸量, 状态, 下单偏移, 交期偏移)
@@ -215,5 +240,5 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f'样例数据生成完成：客户 {customers.__len__()} 家、纸张 {len(papers_data)} 种、'
             f'机台 {len(machines)} 台、订单 {len(orders_spec)} 个、'
-            f'排产 {len(schedules)} 条、返工单 2 张'
+            f'排产 {len(schedules)} 条、返工单 2 张、保养记录 3 条'
         ))

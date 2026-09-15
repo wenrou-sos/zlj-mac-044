@@ -64,3 +64,22 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Helvetica Neue",
 
 .schedule-item { display:flex; align-items:flex-start; gap:8px; padding:8px 10px; margin-bottom:8px; border-radius:6px; background:#ecf5ff; border-left:3px solid #409eff; }
 .schedule-item.done { background:#f0f9eb; border-left-color:#67c23a; opacity:.85; }
+
+/* 机台保养提醒 */
+.machine-card { cursor: pointer; transition: box-shadow .2s; }
+.machine-card:hover { box-shadow: 0 2px 10px rgba(0,0,0,.1); }
+.machine-card.machine-maint { background:#fdf6ec; border-color:#e6a23c; }
+.machine-card.machine-alert { background:#fef0f0; border-color:#f56c6c; }
+.maint-line { margin-top:6px; font-size:12px; line-height:1.5; }
+.maint-banner { margin-bottom:14px; }
+.maint-banner-item { white-space:nowrap; }
+.maint-banner-clickable { cursor:pointer; }
+.maint-alert-box { margin-bottom:12px; background:#fef0f0; padding:8px 12px; }
+.maint-alert-box .el-alert__content { padding:0; }
+.maint-alert-row { display:flex; align-items:center; gap:6px; padding:3px 0; cursor:pointer; font-size:13px; }
+.maint-alert-row:hover { text-decoration: underline; }
+.maint-alert-name { font-weight:600; }
+.el-table .machine-row-maint { background:#faf5ec !important; }
+.el-table .machine-row-maint td { background:transparent !important; }
+.el-table .machine-row-overdue { background:#fff7f7 !important; }
+.el-table .machine-row-overdue td { background:transparent !important; }

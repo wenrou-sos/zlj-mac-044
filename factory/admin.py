@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     Customer,
     Machine,
+    MaintenanceRecord,
     Order,
     Paper,
     PaperTransaction,
@@ -25,10 +26,28 @@ class PaperAdmin(admin.ModelAdmin):
     search_fields = ('name', 'spec')
 
 
+class MaintenanceRecordInline(admin.TabularInline):
+    model = MaintenanceRecord
+    extra = 0
+    fields = ('maintenance_date', 'operator', 'note', 'created_at')
+    readonly_fields = ('created_at',)
+
+
 @admin.register(Machine)
 class MachineAdmin(admin.ModelAdmin):
-    list_display = ('name', 'machine_type', 'status')
+    list_display = ('name', 'machine_type', 'status', 'maintenance_cycle_days',
+                    'last_maintenance_date', 'next_maintenance_date', 'maintenance_state')
     list_filter = ('status',)
+    search_fields = ('name', 'machine_type')
+    inlines = [MaintenanceRecordInline]
+
+
+@admin.register(MaintenanceRecord)
+class MaintenanceRecordAdmin(admin.ModelAdmin):
+    list_display = ('maintenance_date', 'machine', 'operator', 'note')
+    list_filter = ('maintenance_date', 'machine')
+    search_fields = ('machine__name', 'operator', 'note')
+    date_hierarchy = 'maintenance_date'
 
 
 class ProcessProgressInline(admin.StackedInline):

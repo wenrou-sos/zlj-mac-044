@@ -8,6 +8,7 @@ from rest_framework.decorators import action
 from .models import (
     Customer,
     Machine,
+    MaintenanceRecord,
     Order,
     Paper,
     PaperTransaction,
@@ -18,6 +19,7 @@ from .models import (
 from .serializers import (
     CustomerSerializer,
     MachineSerializer,
+    MaintenanceRecordSerializer,
     OrderListSerializer,
     OrderSerializer,
     PaperSerializer,
@@ -92,8 +94,60 @@ class PaperViewSet(viewsets.ModelViewSet):
 
 
 class MachineViewSet(viewsets.ModelViewSet):
-    queryset = Machine.objects.all().order_by('name')
+    queryset = Machine.objects.prefetch_related('maintenance_records').all().order_by('name')
     serializer_class = MachineSerializer
+
+    @staticmethod
+    def _parse_date(raw, field='日期'):
+        """解析 YYYY-MM-DD；为空返回今天，非法返回 None 由调用方报 400"""
+        if raw in (None, ''):
+            return today()
+        from datetime import datetime
+        try:
+            return datetime.strptime(raw, '%Y-%m-%d').date()
+        except (TypeError, ValueError):
+            return None
+
+    @action(detail=True, methods=['get'])
+    def maintenance_records(self, request, pk=None):
+        """某机台的保养登记记录"""
+        machine = self.get_object()
+        return Response(MaintenanceRecordSerializer(machine.maintenance_records.all(), many=True).data)
+
+    @action(detail=True, methods=['post'], url_path='start-maintenance')
+    def start_maintenance(self, request, pk=None):
+        """将机台置为维保中（排产/看板随之联动拦截）"""
+        machine = self.get_object()
+        with transaction.atomic():
+            machine.status = Machine.Status.MAINTENANCE
+            machine.save(update_fields=['status'])
+        return Response(MachineSerializer(machine).data)
+
+    @action(detail=True, methods=['post'])
+    def maintain(self, request, pk=None):
+        """登记保养完成：写保养记录、更新上次保养日期、机台恢复可用（空闲）"""
+        machine = self.get_object()
+        maint_date = self._parse_date(request.data.get('maintenance_date'))
+        if maint_date is None:
+            return Response({'detail': '保养日期格式无效，应为 YYYY-MM-DD'}, status=400)
+        if maint_date > today():
+            return Response({'detail': '保养日期不能晚于今天'}, status=400)
+
+        with transaction.atomic():
+            MaintenanceRecord.objects.create(
+                machine=machine,
+                maintenance_date=maint_date,
+                note=(request.data.get('note') or '').strip(),
+                operator=(request.data.get('operator') or '').strip(),
+            )
+            machine.last_maintenance_date = maint_date
+            # 保养完成即恢复可用，再按现有未完成排产联动为空闲/生产中
+            machine.status = Machine.Status.IDLE
+            machine.save(update_fields=['last_maintenance_date', 'status'])
+        ScheduleViewSet._sync_machine_status(machine.id)
+        machine.refresh_from_db()
+        return Response(MachineSerializer(machine).data)
+
 
 
 class OrderViewSet(viewsets.ModelViewSet):
@@ -186,6 +240,7 @@ class ScheduleViewSet(viewsets.ModelViewSet):
                 machine.save(update_fields=['status'])
 
 
+
 class ReworkViewSet(viewsets.ModelViewSet):
     queryset = ReworkRecord.objects.select_related('order').all()
     serializer_class = ReworkSerializer
@@ -257,6 +312,25 @@ class DashboardViewSet(viewsets.ViewSet):
         machines = Machine.objects.all()
         running = machines.filter(status=Machine.Status.RUNNING).count()
 
+        # 机台保养提醒：维保中 / 已超期 / 即将到期
+        maintenance_alerts = [
+            {
+                'id': m.id, 'name': m.name, 'machine_type': m.machine_type,
+                'status': m.status, 'maintenance_state': m.maintenance_state,
+                'maintenance_cycle_days': m.maintenance_cycle_days,
+                'last_maintenance_date': m.last_maintenance_date,
+                'next_maintenance_date': m.next_maintenance_date,
+                'maintenance_due_days': m.maintenance_due_days,
+            }
+            for m in machines
+            if m.maintenance_state in ('maintenance', 'overdue', 'due_soon')
+        ]
+        state_order = {'maintenance': 0, 'overdue': 1, 'due_soon': 2}
+        maintenance_alerts.sort(key=lambda x: (
+            state_order[x['maintenance_state']],
+            999999 if x['maintenance_due_days'] is None else x['maintenance_due_days'],
+        ))
+
         # 近 7 日排产负荷（计划产量）
         from datetime import timedelta
         load = []
@@ -285,12 +359,17 @@ class DashboardViewSet(viewsets.ViewSet):
                 'open_rework_count': open_reworks,
                 'machine_total': machines.count(),
                 'machine_running': running,
+                'machine_maintenance_count': sum(
+                    1 for a in maintenance_alerts if a['maintenance_state'] == 'maintenance'),
+                'maintenance_alert_count': sum(
+                    1 for a in maintenance_alerts if a['maintenance_state'] in ('overdue', 'due_soon')),
             },
             'status_counts': status_counts,
             'overdue_orders': sorted(overdue, key=lambda x: x['days_left'])[:10],
             'urgent_orders': sorted(urgent, key=lambda x: x['days_left'])[:10],
             'warning_orders': warning[:10],
             'low_papers': low_papers,
+            'maintenance_alerts': maintenance_alerts,
             'stage_stats': stage_stats,
             'weekly_load': load,
         })

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import timedelta
 
 from django.db import models
 from django.utils import timezone
@@ -8,6 +8,10 @@ def today():
     """当前本地日期（兼容 USE_TZ=False）"""
     now = timezone.now()
     return timezone.localtime(now).date() if timezone.is_aware(now) else now.date()
+
+
+# 距下次保养 ≤ 该天数即视为“即将到期”
+MAINTENANCE_SOON_DAYS = 3
 
 
 class Customer(models.Model):
@@ -64,6 +68,8 @@ class Machine(models.Model):
     name = models.CharField('机台名称', max_length=50, unique=True)
     machine_type = models.CharField('机型', max_length=50)
     status = models.CharField('状态', max_length=20, choices=Status.choices, default=Status.IDLE)
+    maintenance_cycle_days = models.PositiveIntegerField('保养周期(天)', null=True, blank=True)
+    last_maintenance_date = models.DateField('上次保养日期', null=True, blank=True)
 
     class Meta:
         verbose_name = '机台'
@@ -71,6 +77,54 @@ class Machine(models.Model):
 
     def __str__(self):
         return self.name
+
+    @property
+    def next_maintenance_date(self):
+        """按周期推算的下次应保养日期；未登记周期或上次保养时为 None"""
+        if self.maintenance_cycle_days and self.last_maintenance_date:
+            return self.last_maintenance_date + timedelta(days=self.maintenance_cycle_days)
+        return None
+
+    @property
+    def maintenance_due_days(self):
+        """距下次保养剩余天数（负数表示已超期）；无法推算时为 None"""
+        nxt = self.next_maintenance_date
+        if nxt is None:
+            return None
+        return (nxt - today()).days
+
+    @property
+    def maintenance_state(self):
+        """保养提醒级别：overdue 已超期 / due_soon 即将到期 / normal 正常 / unconfigured 未设置"""
+        if self.status == self.Status.MAINTENANCE:
+            return 'maintenance'
+        days = self.maintenance_due_days
+        if days is None:
+            return 'unconfigured'
+        if days < 0:
+            return 'overdue'
+        if days <= MAINTENANCE_SOON_DAYS:
+            return 'due_soon'
+        return 'normal'
+
+
+class MaintenanceRecord(models.Model):
+    """机台保养登记记录"""
+
+    machine = models.ForeignKey(Machine, verbose_name='机台', on_delete=models.CASCADE, related_name='maintenance_records')
+    maintenance_date = models.DateField('保养日期')
+    note = models.CharField('保养内容/备注', max_length=300, blank=True)
+    operator = models.CharField('保养人', max_length=50, blank=True)
+    created_at = models.DateTimeField('登记时间', auto_now_add=True)
+
+    class Meta:
+        verbose_name = '保养记录'
+        verbose_name_plural = verbose_name
+        ordering = ['-maintenance_date', '-id']
+
+    def __str__(self):
+        return f'{self.maintenance_date} {self.machine.name} 保养'
+
 
 
 class Order(models.Model):

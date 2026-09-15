@@ -26,6 +26,22 @@ const STAGES = [
 ];
 const PAPER_TYPES = { coated: '铜版纸', offset: '胶版纸', whiteboard: '白卡纸', kraft: '牛皮纸', special: '特种纸' };
 const MACHINE_STATUS = { running: { label: '生产中', type: 'success' }, idle: { label: '空闲', type: 'info' }, maintenance: { label: '维保中', type: 'warning' } };
+/* 机台保养提醒级别（与后端 Machine.maintenance_state 对应） */
+const MAINT_STATE = {
+    maintenance: { label: '维保中', type: 'warning', effect: 'dark' },
+    overdue:     { label: '保养超期', type: 'danger', effect: 'dark' },
+    due_soon:    { label: '即将到期', type: 'warning', effect: 'dark' },
+    normal:      { label: '保养正常', type: 'success', effect: 'plain' },
+    unconfigured:{ label: '未设周期', type: 'info', effect: 'plain' },
+};
+/* 距下次保养的提示文案 */
+function maintDaysText(m) {
+    const d = m.maintenance_due_days;
+    if (d === null || d === undefined) return '未登记保养周期';
+    if (d < 0) return `已超期 ${-d} 天`;
+    if (d === 0) return '今天应保养';
+    return `还剩 ${d} 天`;
+}
 const REWORK_STATUS = { open: { label: '待处理', type: 'danger' }, processing: { label: '返工中', type: 'warning' }, closed: { label: '已闭环', type: 'success' } };
 const REWORK_REASONS = { color: '色差', register: '套印不准', scratch: '划伤/脏点', binding: '装订错误', material: '材料问题', other: '其他' };
 const WARNING_LEVEL = {
@@ -142,13 +158,35 @@ const Dashboard = {
           </div>
 
           <div class="panel">
-            <div class="panel-title">机台概况</div>
+            <div class="panel-title">
+              机台概况
+              <el-tag v-if="maintAlertMachines.length" type="danger" size="small" effect="dark">
+                {{ maintAlertMachines.length }} 台需保养
+              </el-tag>
+            </div>
+            <el-alert v-if="maintAlertMachines.length" :closable="false" class="maint-alert-box">
+              <div v-for="a in maintAlertMachines" :key="a.id" class="maint-alert-row" @click="$emit('go', 'schedules')">
+                <el-tag :type="MAINT_STATE[a.maintenance_state].type" size="small" effect="dark">
+                  {{ MAINT_STATE[a.maintenance_state].label }}
+                </el-tag>
+                <span class="maint-alert-name">{{ a.name }}</span>
+                <span :class="a.maintenance_state==='overdue' ? 'due-overdue' : 'due-urgent'">
+                  {{ maintDaysText(a) }}
+                </span>
+              </div>
+            </el-alert>
             <el-row :gutter="10">
               <el-col :span="12" v-for="m in machines" :key="m.id" style="margin-bottom:10px">
-                <div class="machine-card">
+                <div class="machine-card" :class="{ 'machine-maint': m.status==='maintenance', 'machine-alert': m.maintenance_state==='overdue' }"
+                     @click="$emit('go', 'schedules')">
                   <div class="m-name">{{ m.name }}</div>
                   <div class="m-type">{{ m.machine_type }}</div>
                   <el-tag :type="MACHINE_STATUS[m.status].type" size="small">{{ MACHINE_STATUS[m.status].label }}</el-tag>
+                  <el-tag v-if="['maintenance','overdue','due_soon'].includes(m.maintenance_state)"
+                          :type="MAINT_STATE[m.maintenance_state].type" size="small"
+                          :effect="MAINT_STATE[m.maintenance_state].effect" style="margin-left:4px">
+                    {{ maintDaysText(m) }}
+                  </el-tag>
                 </div>
               </el-col>
             </el-row>
@@ -198,6 +236,11 @@ const Dashboard = {
         const maxLoad = computed(() => Math.max(1, ...data.weekly_load.map(d => d.planned_qty)));
         const barHeight = (v) => Math.round(v / maxLoad.value * 100);
 
+        // 需关注机台：维保中 + 保养超期/即将到期，维保中超期最优先
+        const maintAlertMachines = computed(() => machines.value
+            .filter(m => ['maintenance', 'overdue', 'due_soon'].includes(m.maintenance_state))
+            .sort((a, b) => (a.maintenance_due_days ?? 99999) - (b.maintenance_due_days ?? 99999)));
+
         function daysText(d) { return d < 0 ? `逾期 ${-d} 天` : `剩 ${d} 天`; }
         function daysClass(d) { return d < 0 ? 'due-overdue' : d <= 2 ? 'due-urgent' : 'due-warning'; }
         function formatNum(n) { return Number(n).toLocaleString(); }
@@ -219,6 +262,7 @@ const Dashboard = {
 
         return {
             loading, warnTab, data, machines, cards, warnList, ORDER_STATUS, MACHINE_STATUS,
+            MAINT_STATE, maintAlertMachines, maintDaysText,
             barHeight, daysText, daysClass, formatNum, go, openOrder,
         };
     },
@@ -480,8 +524,15 @@ const Orders = {
         <el-form :model="sform" label-width="82px">
           <el-form-item label="机台" required>
             <el-select v-model="sform.machine" style="width:100%">
-              <el-option v-for="m in machines" :key="m.id" :label="m.name+'（'+m.machine_type+'）'" :value="m.id"></el-option>
+              <el-option v-for="m in machines" :key="m.id"
+                :label="machineOptionLabel(m)" :value="m.id"
+                :disabled="m.status==='maintenance'"></el-option>
             </el-select>
+            <div v-if="selectedMachine" style="margin-top:4px">
+              <el-tag v-if="selectedMachine.status==='maintenance'" type="warning" size="small" effect="dark">维保中，不可排产</el-tag>
+              <el-tag v-else-if="selectedMachine.maintenance_state==='overdue'" type="danger" size="small" effect="dark">保养已超期，建议尽快登记保养</el-tag>
+              <el-tag v-else-if="selectedMachine.maintenance_state==='due_soon'" type="warning" size="small" effect="dark">{{ maintDaysText(selectedMachine) }}到期，请留意</el-tag>
+            </div>
           </el-form-item>
           <el-row :gutter="12">
             <el-col :span="12">
@@ -610,6 +661,15 @@ const Orders = {
             return pform['prepress_status'] === 'done' && pform['printing_status'] === 'done';
         }
 
+        // 排产对话框选中的机台（用于显示维保/保养提醒）
+        const selectedMachine = computed(() => machines.value.find(m => m.id === sform.machine));
+        function machineOptionLabel(m) {
+            if (m.status === 'maintenance') return m.name + '（维保中，不可选）';
+            if (m.maintenance_state === 'overdue') return `${m.name}（保养超期${-m.maintenance_due_days}天）`;
+            if (m.maintenance_state === 'due_soon') return `${m.name}（${maintDaysText(m)}到期）`;
+            return m.name + '（' + m.machine_type + '）';
+        }
+
         async function load() {
             loading.value = true;
             try {
@@ -696,7 +756,8 @@ const Orders = {
         }
 
         function openSchedule() {
-            Object.assign(sform, { machine: machines.value[0]?.id || null, planned_date: todayStr(), shift: '白班', planned_qty: detail.value.quantity, actual_qty: 0, remark: '' });
+            const firstAvailable = machines.value.find(m => m.status !== 'maintenance');
+            Object.assign(sform, { machine: firstAvailable?.id || null, planned_date: todayStr(), shift: '白班', planned_qty: detail.value.quantity, actual_qty: 0, remark: '' });
             schedDialog.value = true;
         }
         async function saveSchedule() {
@@ -752,6 +813,7 @@ const Orders = {
             progressDialog, pform, schedDialog, sform, reworkDialog, rform,
             ORDER_STATUS, STAGE_STATUS, STAGES, REWORK_STATUS, REWORK_REASONS, WARNING_LEVEL,
             formatNum, stageClass, activeStage, progressStatus, canMarkDone,
+            selectedMachine, machineOptionLabel, maintDaysText,
             load, reset, openCreate, openEdit, saveOrder, openDetail,
             openProgress, saveProgress, openSchedule, saveSchedule, toggleSchedule,
             openRework, saveRework,
@@ -988,18 +1050,55 @@ const Schedules = {
           </el-form-item>
         </el-form>
 
+        <!-- 机台保养预警横幅 -->
+        <el-alert v-if="maintAlerts.length" :closable="false" class="maint-banner"
+                  :type="hasOverdueOrMaint ? 'error' : 'warning'" show-icon>
+          <template #title>
+            <span>机台保养提醒：</span>
+            <span v-for="a in maintAlerts" :key="a.id" class="maint-banner-item"
+                  :class="{ 'maint-banner-clickable': a.status==='maintenance' }"
+                  @click="a.status==='maintenance' && openMaintain(a)">
+              <strong>{{ a.name }}</strong>
+              <el-tag :type="MAINT_STATE[a.maintenance_state].type" size="small" effect="dark" style="margin:0 4px">
+                {{ MAINT_STATE[a.maintenance_state].label }}
+              </el-tag>
+              <span :class="a.maintenance_state==='overdue' ? 'due-overdue' : 'due-urgent'">{{ maintDaysText(a) }}</span>
+              <el-button v-if="a.status==='maintenance'" link type="primary" size="small" style="margin-left:4px">登记保养</el-button>
+              <span style="margin-right:18px"></span>
+            </span>
+          </template>
+        </el-alert>
+
         <!-- 日历式排产表：行=机台，单元格=当天任务 -->
-        <el-table :data="machineRows" border>
-          <el-table-column label="机台" width="230" fixed>
+        <el-table :data="machineRows" border :row-class-name="machineRowClass">
+          <el-table-column label="机台" width="260" fixed>
             <template #default="{ row }">
-              <div style="font-weight:600">{{ row.name }}</div>
-              <div class="muted">{{ row.machine_type }}</div>
-              <el-tag :type="MACHINE_STATUS[row.status].type" size="small" style="margin-top:4px">{{ MACHINE_STATUS[row.status].label }}</el-tag>
+              <div :style="row.status==='maintenance' ? 'opacity:.6' : ''">
+                <div style="font-weight:600">{{ row.name }}</div>
+                <div class="muted">{{ row.machine_type }}</div>
+                <div style="margin-top:4px">
+                  <el-tag :type="MACHINE_STATUS[row.status].type" size="small">{{ MACHINE_STATUS[row.status].label }}</el-tag>
+                </div>
+                <div class="maint-line">
+                  <span class="muted" v-if="!row.maintenance_cycle_days">未设置保养周期</span>
+                  <template v-else>
+                    周期 {{ row.maintenance_cycle_days }} 天 ·
+                    <span :class="row.maintenance_state==='overdue' ? 'due-overdue'
+                                 : row.maintenance_state==='due_soon' ? 'due-urgent' : ''">
+                      下次 {{ row.next_maintenance_date }}（{{ maintDaysText(row) }}）
+                    </span>
+                  </template>
+                </div>
+              </div>
             </template>
           </el-table-column>
           <el-table-column :label="curDate + ' 排产任务'">
             <template #default="{ row }">
-              <div v-if="!row.items.length" class="muted">— 无排产 —</div>
+              <el-alert v-if="row.status==='maintenance'" type="warning" :closable="false" show-icon
+                        title="该机台维保中，不能排产" style="margin-bottom:8px">
+                <el-button type="primary" size="small" @click="openMaintain(row)">登记保养并恢复</el-button>
+              </el-alert>
+              <div v-if="!row.items.length && row.status!=='maintenance'" class="muted">— 无排产 —</div>
               <div v-for="item in row.items" :key="item.id" class="schedule-item"
                    :class="{ done: item.done }">
                 <div style="flex:1">
@@ -1036,8 +1135,12 @@ const Schedules = {
         <el-form :model="form" label-width="86px">
           <el-form-item label="机台" required>
             <el-select v-model="form.machine" style="width:100%">
-              <el-option v-for="m in machines" :key="m.id" :label="m.name + '（' + m.machine_type + '）'" :value="m.id" :disabled="m.status==='maintenance'"></el-option>
+              <el-option v-for="m in machines" :key="m.id" :label="machineOptionLabel(m)" :value="m.id"
+                         :disabled="m.status==='maintenance'"></el-option>
             </el-select>
+            <div v-if="selectedFormMachine && selectedFormMachine.maintenance_state==='overdue'" style="margin-top:4px">
+              <el-tag type="danger" size="small" effect="dark">该机台保养已超期，建议先保养再排产（仍可保存）</el-tag>
+            </div>
           </el-form-item>
           <el-form-item label="订单" required>
             <el-select v-model="form.order" filterable style="width:100%">
@@ -1082,28 +1185,47 @@ const Schedules = {
       </el-dialog>
 
       <!-- 机台管理 -->
-      <el-dialog v-model="mDialog" title="机台管理" width="560px">
+      <el-dialog v-model="mDialog" title="机台管理" width="860px">
         <el-button type="primary" size="small" style="margin-bottom:10px" @click="openMachine(null)">+ 新增机台</el-button>
         <el-table :data="machines" border size="small">
-          <el-table-column prop="name" label="机台名称" min-width="170"></el-table-column>
-          <el-table-column prop="machine_type" label="机型" min-width="150"></el-table-column>
-          <el-table-column label="状态" width="100">
+          <el-table-column prop="name" label="机台名称" min-width="150"></el-table-column>
+          <el-table-column prop="machine_type" label="机型" min-width="130"></el-table-column>
+          <el-table-column label="状态" width="90">
             <template #default="{ row }">
               <el-select v-model="row.status" size="small" @change="changeMachineStatus(row)">
                 <el-option v-for="(s, k) in MACHINE_STATUS" :key="k" :label="s.label" :value="k"></el-option>
               </el-select>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="90">
+          <el-table-column label="保养周期" width="80">
+            <template #default="{ row }">{{ row.maintenance_cycle_days ? row.maintenance_cycle_days + '天' : '—' }}</template>
+          </el-table-column>
+          <el-table-column label="上次保养" width="105">
+            <template #default="{ row }">{{ row.last_maintenance_date || '—' }}</template>
+          </el-table-column>
+          <el-table-column label="到期/提醒" width="120">
             <template #default="{ row }">
+              <el-tag v-if="['maintenance','overdue','due_soon'].includes(row.maintenance_state)"
+                      :type="MAINT_STATE[row.maintenance_state].type" size="small"
+                      :effect="MAINT_STATE[row.maintenance_state].effect">
+                {{ maintDaysText(row) }}
+              </el-tag>
+              <span v-else class="muted">{{ row.next_maintenance_date || '—' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="170">
+            <template #default="{ row }">
+              <el-button v-if="row.status!=='maintenance'" link type="warning" size="small" @click="startMaintenance(row)">维保</el-button>
+              <el-button v-if="row.status==='maintenance'" link type="success" size="small" @click="openMaintain(row)">登记保养</el-button>
               <el-button link type="primary" size="small" @click="openMachine(row)">编辑</el-button>
+              <el-button link type="info" size="small" @click="openRecords(row)">记录</el-button>
             </template>
           </el-table-column>
         </el-table>
       </el-dialog>
 
-      <el-dialog v-model="mFormVisible" :title="mEditing ? '编辑机台' : '新增机台'" width="420px">
-        <el-form :model="mform" label-width="80px">
+      <el-dialog v-model="mFormVisible" :title="mEditing ? '编辑机台' : '新增机台'" width="460px">
+        <el-form :model="mform" label-width="100px">
           <el-form-item label="名称" required><el-input v-model="mform.name"></el-input></el-form-item>
           <el-form-item label="机型"><el-input v-model="mform.machine_type" placeholder="如 对开四色胶印机"></el-input></el-form-item>
           <el-form-item label="状态">
@@ -1111,11 +1233,56 @@ const Schedules = {
               <el-option v-for="(s, k) in MACHINE_STATUS" :key="k" :label="s.label" :value="k"></el-option>
             </el-select>
           </el-form-item>
+          <el-form-item label="保养周期(天)">
+            <el-input-number v-model="mform.maintenance_cycle_days" :min="1" :step="1" style="width:100%"
+                             controls-position="right" placeholder="如 30"></el-input-number>
+          </el-form-item>
+          <el-form-item label="上次保养日期">
+            <el-date-picker v-model="mform.last_maintenance_date" type="date" value-format="YYYY-MM-DD"
+                            :disabled-date="disableFutureDate" style="width:100%"></el-date-picker>
+          </el-form-item>
+          <div class="muted" style="padding-left:100px;margin:-6px 0 10px">
+            下次保养日期将按“上次保养 + 周期”自动推算；维保完成请用“登记保养”更新
+          </div>
         </el-form>
         <template #footer>
           <el-button @click="mFormVisible=false">取消</el-button>
           <el-button type="primary" @click="saveMachine">保存</el-button>
         </template>
+      </el-dialog>
+
+      <!-- 保养登记 -->
+      <el-dialog v-model="maintDialog" :title="'保养登记 — ' + (maintRow?.name || '')" width="460px">
+        <el-form :model="maintForm" label-width="90px">
+          <el-form-item label="保养日期" required>
+            <el-date-picker v-model="maintForm.maintenance_date" type="date" value-format="YYYY-MM-DD"
+                            :disabled-date="disableFutureDate" style="width:100%"></el-date-picker>
+          </el-form-item>
+          <el-form-item label="保养人">
+            <el-input v-model="maintForm.operator" placeholder="如 张师傅 / 设备科"></el-input>
+          </el-form-item>
+          <el-form-item label="保养内容">
+            <el-input v-model="maintForm.note" type="textarea" :rows="3"
+                      placeholder="如 更换墨辊、加注润滑脂、校验压力"></el-input>
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="maintDialog=false">取消</el-button>
+          <el-button type="success" @click="doMaintain">完成登记，恢复可用</el-button>
+        </template>
+      </el-dialog>
+
+      <!-- 保养记录 -->
+      <el-dialog v-model="recordsDialog" :title="'保养记录 — ' + (recordsRow?.name || '')" width="560px">
+        <el-table :data="maintRecords" border size="small" max-height="420" empty-text="暂无保养记录">
+          <el-table-column prop="maintenance_date" label="保养日期" width="110"></el-table-column>
+          <el-table-column prop="operator" label="保养人" width="100">
+            <template #default="{ row }">{{ row.operator || '—' }}</template>
+          </el-table-column>
+          <el-table-column prop="note" label="保养内容" min-width="200">
+            <template #default="{ row }">{{ row.note || '—' }}</template>
+          </el-table-column>
+        </el-table>
       </el-dialog>
     </div>`,
     setup() {
@@ -1132,9 +1299,18 @@ const Schedules = {
         const mDialog = ref(false);
         const mFormVisible = ref(false);
         const mEditing = ref(null);
-        const mform = reactive({ name: '', machine_type: '', status: 'idle' });
+        const mform = reactive({ name: '', machine_type: '', status: 'idle', maintenance_cycle_days: null, last_maintenance_date: '' });
+
+        const maintDialog = ref(false);
+        const maintRow = ref(null);
+        const maintForm = reactive({ maintenance_date: todayStr(), operator: '', note: '' });
+
+        const recordsDialog = ref(false);
+        const recordsRow = ref(null);
+        const maintRecords = ref([]);
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
+        function disableFutureDate(d) { return d.getTime() > Date.now() - 8.64e6; }
 
         const machineRows = computed(() => machines.value.map(m => {
             const items = schedules.value.filter(s => s.machine === m.id);
@@ -1142,6 +1318,26 @@ const Schedules = {
             const actualTotal = items.reduce((a, i) => a + Number(i.actual_qty), 0);
             return { ...m, items, planTotal, actualTotal };
         }));
+
+        // 需关注机台：维保中 / 保养超期 / 即将到期
+        const maintAlerts = computed(() => machines.value
+            .filter(m => ['maintenance', 'overdue', 'due_soon'].includes(m.maintenance_state))
+            .sort((a, b) => (a.maintenance_due_days ?? 99999) - (b.maintenance_due_days ?? 99999)));
+        const hasOverdueOrMaint = computed(() => maintAlerts.value
+            .some(m => ['maintenance', 'overdue'].includes(m.maintenance_state)));
+
+        function machineRowClass({ row }) {
+            if (row.status === 'maintenance') return 'machine-row-maint';
+            if (row.maintenance_state === 'overdue') return 'machine-row-overdue';
+            return '';
+        }
+        function machineOptionLabel(m) {
+            if (m.status === 'maintenance') return m.name + '（维保中，不可选）';
+            if (m.maintenance_state === 'overdue') return `${m.name}（保养超期${-m.maintenance_due_days}天）`;
+            if (m.maintenance_state === 'due_soon') return `${m.name}（${maintDaysText(m)}到期）`;
+            return m.name + '（' + m.machine_type + '）';
+        }
+        const selectedFormMachine = computed(() => machines.value.find(m => m.id === form.machine));
 
         async function loadMachines() { machines.value = await apiGet('/machines/'); }
         async function loadSchedules() {
@@ -1170,7 +1366,8 @@ const Schedules = {
                 remark: item.remark, done: item.done,
             });
             else Object.assign(form, {
-                machine: machines.value[0]?.id || null, order: activeOrders.value[0]?.id || null,
+                machine: machines.value.find(m => m.status !== 'maintenance')?.id || null,
+                order: activeOrders.value[0]?.id || null,
                 planned_date: curDate.value, shift: '白班', planned_qty: 0, actual_qty: 0,
                 remark: '', done: false,
             });
@@ -1204,23 +1401,80 @@ const Schedules = {
         }
 
         async function changeMachineStatus(row) {
-            await apiPatch('/machines/' + row.id + '/', { status: row.status });
-            ElMessage.success('机台状态已更新');
+            try {
+                if (row.status === 'maintenance') {
+                    await ElMessageBox.confirm(
+                        `确定将「${row.name}」置为维保中吗？维保期间任何入口都无法给该机台排产。`,
+                        '进入维保', { type: 'warning', confirmButtonText: '置为维保中', cancelButtonText: '取消' });
+                }
+                await apiPatch('/machines/' + row.id + '/', { status: row.status });
+                ElMessage.success('机台状态已更新');
+                await loadMachines();
+            } catch (e) {
+                if (e === 'cancel' || e?.message === 'cancel') { /* 用户取消 */ }
+                else ElMessage.error(e.message);
+                loadMachines();  // 取消或失败时还原下拉显示
+            }
+        }
+        async function startMaintenance(row) {
+            try {
+                await ElMessageBox.confirm(
+                    `确定将「${row.name}」置为维保中吗？维保期间任何入口都无法给该机台排产。`,
+                    '进入维保', { type: 'warning', confirmButtonText: '置为维保中', cancelButtonText: '取消' });
+                await apiPost(`/machines/${row.id}/start-maintenance/`);
+                ElMessage.success('该机台已进入维保，所有排产入口已禁用该机台');
+                await load();
+            } catch (e) {
+                if (e !== 'cancel') ElMessage.error(e.message);
+            }
+        }
+        function openMaintain(row) {
+            maintRow.value = row;
+            Object.assign(maintForm, { maintenance_date: todayStr(), operator: '', note: '' });
+            maintDialog.value = true;
+        }
+        async function doMaintain() {
+            if (!maintForm.maintenance_date) { ElMessage.warning('请选择保养日期'); return; }
+            try {
+                await apiPost(`/machines/${maintRow.value.id}/maintain/`, { ...maintForm });
+                ElMessage.success('保养已登记，机台恢复可用');
+                maintDialog.value = false;
+                await load();
+            } catch (e) { ElMessage.error(e.message); }
+        }
+        async function openRecords(row) {
+            recordsRow.value = row;
+            recordsDialog.value = true;
+            try {
+                maintRecords.value = await apiGet(`/machines/${row.id}/maintenance_records/`);
+            } catch (e) { ElMessage.error(e.message); }
         }
         function openMachine(row) {
             mEditing.value = row;
-            if (row) Object.assign(mform, { name: row.name, machine_type: row.machine_type, status: row.status });
-            else Object.assign(mform, { name: '', machine_type: '', status: 'idle' });
+            if (row) Object.assign(mform, {
+                name: row.name, machine_type: row.machine_type, status: row.status,
+                maintenance_cycle_days: row.maintenance_cycle_days ?? null,
+                last_maintenance_date: row.last_maintenance_date || '',
+            });
+            else Object.assign(mform, {
+                name: '', machine_type: '', status: 'idle',
+                maintenance_cycle_days: null, last_maintenance_date: '',
+            });
             mFormVisible.value = true;
         }
         async function saveMachine() {
             if (!mform.name) { ElMessage.warning('请输入名称'); return; }
             try {
-                if (mEditing.value) await apiPatch('/machines/' + mEditing.value.id + '/', { ...mform });
-                else await apiPost('/machines/', { ...mform });
+                const payload = {
+                    name: mform.name, machine_type: mform.machine_type, status: mform.status,
+                    maintenance_cycle_days: mform.maintenance_cycle_days || null,
+                    last_maintenance_date: mform.last_maintenance_date || null,
+                };
+                if (mEditing.value) await apiPatch('/machines/' + mEditing.value.id + '/', payload);
+                else await apiPost('/machines/', payload);
                 ElMessage.success('已保存');
                 mFormVisible.value = false;
-                loadMachines();
+                await load();
             } catch (e) { ElMessage.error(e.message); }
         }
 
@@ -1228,9 +1482,13 @@ const Schedules = {
         return {
             loading, machines, schedules, activeOrders, curDate, machineRows,
             formVisible, editing, form, mDialog, mFormVisible, mEditing, mform,
-            MACHINE_STATUS, formatNum, todayStr,
+            maintDialog, maintRow, maintForm, recordsDialog, recordsRow, maintRecords,
+            MACHINE_STATUS, MAINT_STATE, maintAlerts, hasOverdueOrMaint, maintDaysText,
+            formatNum, todayStr, disableFutureDate, machineRowClass, machineOptionLabel,
+            selectedFormMachine,
             loadSchedules, shiftDay, openCreate, save, remove, toggleDone,
-            changeMachineStatus, openMachine, saveMachine,
+            changeMachineStatus, startMaintenance, openMaintain, doMaintain, openRecords,
+            openMachine, saveMachine,
         };
     },
 };

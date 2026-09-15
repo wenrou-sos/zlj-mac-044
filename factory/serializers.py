@@ -4,6 +4,7 @@ from .models import (
     today as _today,
     Customer,
     Machine,
+    MaintenanceRecord,
     Order,
     Paper,
     PaperTransaction,
@@ -28,12 +29,39 @@ class PaperSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+class MaintenanceRecordSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MaintenanceRecord
+        fields = '__all__'
+        read_only_fields = ['created_at']
+
+    def validate_maintenance_date(self, value):
+        if value and value > _today():
+            raise serializers.ValidationError('保养日期不能晚于今天')
+        return value
+
+
 class MachineSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
+    next_maintenance_date = serializers.DateField(read_only=True)
+    maintenance_due_days = serializers.IntegerField(read_only=True, allow_null=True)
+    maintenance_state = serializers.CharField(read_only=True)
+    maintenance_records = MaintenanceRecordSerializer(many=True, read_only=True)
 
     class Meta:
         model = Machine
         fields = '__all__'
+
+    def validate_maintenance_cycle_days(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError('保养周期必须大于 0 天')
+        return value
+
+    def validate_last_maintenance_date(self, value):
+        if value and value > _today():
+            raise serializers.ValidationError('上次保养日期不能晚于今天')
+        return value
+
 
 
 class ProcessProgressSerializer(serializers.ModelSerializer):
@@ -181,6 +209,15 @@ class ScheduleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Schedule
         fields = '__all__'
+
+    def validate(self, attrs):
+        # 维保机台一律禁止排产；PATCH 时取实例当前机台兜底，保证从任何入口都拦得住
+        machine = attrs.get('machine') or getattr(self.instance, 'machine', None)
+        if machine and machine.status == Machine.Status.MAINTENANCE:
+            raise serializers.ValidationError(
+                {'machine': f'机台「{machine.name}」维保中，登记保养完成后方可排产'})
+        return attrs
+
 
 
 class ReworkSerializer(serializers.ModelSerializer):
