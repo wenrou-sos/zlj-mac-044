@@ -1,3 +1,4 @@
+from django.db.models import Sum
 from rest_framework import serializers
 
 from .models import (
@@ -122,12 +123,15 @@ class OrderListSerializer(serializers.ModelSerializer):
     warning_level = serializers.SerializerMethodField()
     progress = ProcessProgressSerializer(read_only=True)
     open_rework_count = serializers.SerializerMethodField()
+    received_qty = serializers.SerializerMethodField()
+    remaining_qty = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
         fields = [
             'id', 'order_no', 'customer', 'customer_name', 'product_name',
             'quantity', 'paper', 'paper_name', 'paper_consumption',
+            'received_qty', 'remaining_qty',
             'status', 'status_display', 'order_date', 'due_date',
             'completed_date', 'remark', 'days_left', 'warning_level',
             'progress', 'open_rework_count',
@@ -135,6 +139,19 @@ class OrderListSerializer(serializers.ModelSerializer):
 
     def get_paper_name(self, obj):
         return f'{obj.paper.name} {obj.paper.spec}'
+
+    def get_received_qty(self, obj):
+        """已领料张数：优先取视图注解值，未注解时实时汇总出库流水"""
+        annotated = getattr(obj, 'received_qty_annotated', None)
+        if annotated is not None:
+            return annotated
+        return (PaperTransaction.objects
+                .filter(order=obj, tx_type=PaperTransaction.TxType.OUT)
+                .aggregate(s=Sum('quantity'))['s'] or 0)
+
+    def get_remaining_qty(self, obj):
+        """未领张数（为负表示超领，前端据此提示）"""
+        return obj.paper_consumption - self.get_received_qty(obj)
 
     def get_days_left(self, obj):
         cur = _today()
@@ -162,15 +179,25 @@ class OrderListSerializer(serializers.ModelSerializer):
 class OrderSerializer(OrderListSerializer):
     schedules = serializers.SerializerMethodField()
     reworks = serializers.SerializerMethodField()
+    paper_stock = serializers.IntegerField(source='paper.stock', read_only=True)
+    paper_transactions = serializers.SerializerMethodField()
 
     class Meta(OrderListSerializer.Meta):
-        fields = OrderListSerializer.Meta.fields + ['created_at', 'schedules', 'reworks']
+        fields = OrderListSerializer.Meta.fields + [
+            'created_at', 'paper_stock', 'paper_transactions', 'schedules', 'reworks',
+        ]
 
     def get_schedules(self, obj):
         return ScheduleSerializer(obj.schedules.select_related('machine'), many=True).data
 
     def get_reworks(self, obj):
         return ReworkSerializer(obj.reworks.all(), many=True).data
+
+    def get_paper_transactions(self, obj):
+        """该订单的领料流水（出库记录），用于详情页核对每次领料"""
+        qs = (PaperTransaction.objects.filter(order=obj)
+              .select_related('paper', 'order').order_by('-tx_date', '-id'))
+        return PaperTransactionSerializer(qs, many=True).data
 
 
 class ScheduleSerializer(serializers.ModelSerializer):

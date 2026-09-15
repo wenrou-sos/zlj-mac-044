@@ -1,5 +1,6 @@
 from django.db import transaction
-from django.db.models import Count, Sum
+from django.db.models import Count, IntegerField, Q, Sum, Value
+from django.db.models.functions import Coalesce
 from .models import today
 from rest_framework import viewsets
 from rest_framework.response import Response
@@ -97,8 +98,17 @@ class MachineViewSet(viewsets.ModelViewSet):
 
 
 class OrderViewSet(viewsets.ModelViewSet):
-    queryset = Order.objects.select_related('customer', 'paper', 'progress').all()
     serializer_class = OrderSerializer
+
+    def get_queryset(self):
+        # 注解已领料张数（该订单的出库流水合计），避免列表逐单查询
+        return Order.objects.select_related('customer', 'paper', 'progress').annotate(
+            received_qty_annotated=Coalesce(
+                Sum('papertransaction__quantity',
+                    filter=Q(papertransaction__tx_type=PaperTransaction.TxType.OUT)),
+                Value(0), output_field=IntegerField(),
+            )
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -144,6 +154,70 @@ class OrderViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def receive_paper(self, request, pk=None):
+        """订单领料：按用纸量从订单对应纸张出库。
+
+        - 不传 quantity 时默认一次领完全部未领；传 quantity 则分批领料
+        - 超出未领数量直接拦截，防止同一订单重复扣料
+        - 库存不足时返回还差多少张
+        每次领料自动写流水并关联订单与纸张。
+        """
+        self.get_object()  # 404 检查
+        with transaction.atomic():
+            order = (Order.objects.select_for_update()
+                     .select_related('paper').get(pk=self.kwargs['pk']))
+            paper = Paper.objects.select_for_update().get(pk=order.paper_id)
+
+            if order.paper_consumption <= 0:
+                return Response({'detail': '该订单未填写用纸量，请先在订单中维护用纸量后再领料'},
+                                status=400)
+
+            received = (PaperTransaction.objects
+                        .filter(order=order, tx_type=PaperTransaction.TxType.OUT)
+                        .aggregate(s=Sum('quantity'))['s'] or 0)
+            remaining = order.paper_consumption - received
+            if remaining <= 0:
+                return Response(
+                    {'detail': f'该订单用纸量 {order.paper_consumption} 张已全部领完'
+                               f'（已领 {received} 张），请勿重复领料'},
+                    status=400)
+
+            raw = request.data.get('quantity')
+            if raw in (None, ''):
+                qty = remaining  # 默认一次领完全部未领
+            else:
+                try:
+                    qty = int(raw)
+                except (TypeError, ValueError):
+                    return Response({'detail': '领料数量必须为整数'}, status=400)
+            if qty <= 0:
+                return Response({'detail': '领料数量必须大于 0'}, status=400)
+            if qty > remaining:
+                return Response(
+                    {'detail': f'超出未领数量：用纸量 {order.paper_consumption} 张，'
+                               f'已领 {received} 张，未领 {remaining} 张，'
+                               f'本次最多可领 {remaining} 张'},
+                    status=400)
+            stock = int(paper.stock)
+            if qty > stock:
+                return Response(
+                    {'detail': f'库存不足：当前库存 {stock} 张，'
+                               f'本次需领 {qty} 张，还差 {qty - stock} 张'},
+                    status=400)
+
+            paper.stock -= qty
+            paper.save(update_fields=['stock'])
+            tx = PaperTransaction.objects.create(
+                paper=paper, tx_type=PaperTransaction.TxType.OUT, quantity=qty,
+                order=order, tx_date=today(),
+                note=request.data.get('note') or f'{order.order_no} 生产领料',
+            )
+
+        data = OrderSerializer(self.get_object(), context={'request': request}).data
+        data['receive_message'] = f'领料成功：{order.order_no} 本次出库 {tx.quantity} 张'
+        return Response(data)
 
 
 class ScheduleViewSet(viewsets.ModelViewSet):

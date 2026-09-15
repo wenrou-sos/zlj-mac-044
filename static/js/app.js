@@ -266,10 +266,13 @@ const Orders = {
           <el-table-column prop="order_no" label="订单编号" width="150"></el-table-column>
           <el-table-column prop="product_name" label="产品名称" min-width="190"></el-table-column>
           <el-table-column prop="customer_name" label="客户" width="170"></el-table-column>
-          <el-table-column label="印数/用纸" width="150">
+          <el-table-column label="印数/用纸" width="160">
             <template #default="{ row }">
               <div>{{ formatNum(row.quantity) }} 份</div>
               <div class="muted">{{ formatNum(row.paper_consumption) }} 张</div>
+              <div style="font-size:12px" :style="{ color: row.remaining_qty > 0 ? '#e6a23c' : '#67c23a' }">
+                已领 {{ formatNum(row.received_qty) }} / 未领 {{ formatNum(row.remaining_qty) }}
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="状态" width="100">
@@ -407,6 +410,57 @@ const Orders = {
             </el-row>
           </div>
 
+          <div class="panel" style="box-shadow:none;border:1px solid #ebeef5;margin-top:16px">
+            <div class="panel-title">纸张领料（{{ detail.paper_name }}）
+              <span>
+                <el-button type="warning" size="small" plain @click="openReceive" :disabled="detail.remaining_qty <= 0">分批领料</el-button>
+                <el-button type="warning" size="small" @click="receiveAll" :disabled="detail.remaining_qty <= 0">一键领足</el-button>
+              </span>
+            </div>
+            <el-row :gutter="12" style="margin-bottom:10px;text-align:center">
+              <el-col :span="6">
+                <div class="muted">用纸量</div>
+                <div style="font-size:18px;font-weight:700">{{ formatNum(detail.paper_consumption) }} 张</div>
+              </el-col>
+              <el-col :span="6">
+                <div class="muted">已领</div>
+                <div style="font-size:18px;font-weight:700;color:#67c23a">{{ formatNum(detail.received_qty) }} 张</div>
+              </el-col>
+              <el-col :span="6">
+                <div class="muted">未领</div>
+                <div style="font-size:18px;font-weight:700" :style="{ color: detail.remaining_qty > 0 ? '#e6a23c' : '#67c23a' }">
+                  {{ formatNum(detail.remaining_qty) }} 张
+                </div>
+              </el-col>
+              <el-col :span="6">
+                <div class="muted">当前库存</div>
+                <div style="font-size:18px;font-weight:700" :style="{ color: detail.paper_stock < detail.remaining_qty ? '#f56c6c' : '#303133' }">
+                  {{ formatNum(detail.paper_stock) }} 张
+                </div>
+              </el-col>
+            </el-row>
+            <el-progress :percentage="receivePercent" :status="detail.remaining_qty <= 0 ? 'success' : ''"></el-progress>
+            <el-alert v-if="detail.remaining_qty > 0 && detail.paper_stock < detail.remaining_qty"
+              type="error" :closable="false" style="margin-top:10px"
+              :title="'库存不足：未领 ' + formatNum(detail.remaining_qty) + ' 张，当前库存 ' + formatNum(detail.paper_stock) + ' 张，还差 ' + formatNum(detail.remaining_qty - detail.paper_stock) + ' 张'"></el-alert>
+            <el-table :data="detail.paper_transactions" size="small" border max-height="220" style="margin-top:10px" empty-text="暂无领料记录">
+              <el-table-column prop="tx_date" label="日期" width="110"></el-table-column>
+              <el-table-column label="类型" width="80">
+                <template #default="{ row }">
+                  <el-tag :type="row.tx_type==='in' ? 'success' : 'warning'" size="small">{{ row.tx_type_display }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="数量(张)" width="120">
+                <template #default="{ row }">
+                  <span :style="{ color: row.tx_type==='in' ? '#67c23a' : '#e6a23c', fontWeight: 600 }">
+                    {{ row.tx_type === 'in' ? '+' : '-' }}{{ formatNum(row.quantity) }}
+                  </span>
+                </template>
+              </el-table-column>
+              <el-table-column prop="note" label="备注" min-width="180"></el-table-column>
+            </el-table>
+          </div>
+
           <el-row :gutter="16" style="margin-top:16px">
             <el-col :span="13">
               <div class="panel" style="box-shadow:none;border:1px solid #ebeef5">
@@ -454,6 +508,42 @@ const Orders = {
           </el-row>
         </template>
       </el-drawer>
+
+      <!-- 分批领料 -->
+      <el-dialog v-model="receiveDialog" :title="'订单领料 — ' + (detail.order_no || '')" width="480px">
+        <el-form label-width="90px">
+          <el-form-item label="纸张">
+            <span>{{ detail.paper_name }}</span>
+          </el-form-item>
+          <el-form-item label="领料进度">
+            <span>
+              已领 <b style="color:#67c23a">{{ formatNum(detail.received_qty) }}</b> 张 /
+              用纸量 {{ formatNum(detail.paper_consumption) }} 张，
+              未领 <b style="color:#e6a23c">{{ formatNum(detail.remaining_qty) }}</b> 张
+            </span>
+          </el-form-item>
+          <el-form-item label="当前库存">
+            <span :style="{ color: detail.paper_stock < detail.remaining_qty ? '#f56c6c' : '#303133', fontWeight: 600 }">
+              {{ formatNum(detail.paper_stock) }} 张
+            </span>
+            <span v-if="detail.paper_stock < detail.remaining_qty" style="color:#f56c6c;font-size:12px;margin-left:8px">
+              还差 {{ formatNum(detail.remaining_qty - detail.paper_stock) }} 张
+            </span>
+          </el-form-item>
+          <el-form-item label="本次领料" required>
+            <el-input-number v-model="receiveForm.quantity" :min="1" :max="detail.remaining_qty" :step="500" style="width:100%"></el-input-number>
+          </el-form-item>
+          <el-form-item label="备注">
+            <el-input v-model="receiveForm.note" placeholder="生产领料"></el-input>
+          </el-form-item>
+          <el-alert v-if="receiveForm.quantity > detail.paper_stock" type="error" :closable="false"
+            :title="'库存不足：本次需领 ' + formatNum(receiveForm.quantity) + ' 张，当前库存 ' + formatNum(detail.paper_stock) + ' 张，还差 ' + formatNum(receiveForm.quantity - detail.paper_stock) + ' 张'"></el-alert>
+        </el-form>
+        <template #footer>
+          <el-button @click="receiveDialog=false">取消</el-button>
+          <el-button type="warning" @click="doReceive">确认领料</el-button>
+        </template>
+      </el-dialog>
 
       <!-- 更新工序进度 -->
       <el-dialog v-model="progressDialog" title="更新工序进度" width="560px">
@@ -583,6 +673,16 @@ const Orders = {
 
         const reworkDialog = ref(false);
         const rform = reactive({ stage: 'printing', reason: 'color', qty: 100, handler: '', found_at: todayStr(), description: '' });
+
+        const receiveDialog = ref(false);
+        const receiveForm = reactive({ quantity: 0, note: '' });
+
+        // 领料进度百分比（已领/用纸量）
+        const receivePercent = computed(() => {
+            const total = detail.value.paper_consumption || 0;
+            if (!total) return 0;
+            return Math.min(100, Math.round((detail.value.received_qty || 0) / total * 100));
+        });
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
 
@@ -724,6 +824,39 @@ const Orders = {
             Object.assign(rform, { stage: 'printing', reason: 'color', qty: 100, handler: '', found_at: todayStr(), description: '' });
             reworkDialog.value = true;
         }
+
+        // ---------- 订单领料 ----------
+        function openReceive() {
+            // 默认带出全部未领数量，可改为分批；库存不足时对话框会提示还差多少张
+            Object.assign(receiveForm, { quantity: detail.value.remaining_qty, note: '' });
+            receiveDialog.value = true;
+        }
+        async function receiveAll() {
+            try {
+                await ElMessageBox.confirm(
+                    `将按未领数量一次性领料出库 ${formatNum(detail.value.remaining_qty)} 张（${detail.value.paper_name}），确认？`,
+                    '一键领足', { type: 'warning', confirmButtonText: '确认领料', cancelButtonText: '取消' });
+            } catch (e) { return; }
+            await submitReceive(null);  // 不传数量 = 服务端按全部未领出库
+        }
+        async function doReceive() {
+            if (!receiveForm.quantity || receiveForm.quantity <= 0) {
+                ElMessage.warning('请填写领料数量'); return;
+            }
+            await submitReceive(receiveForm.quantity);
+        }
+        async function submitReceive(qty) {
+            try {
+                const body = { note: receiveForm.note };
+                if (qty) body.quantity = qty;
+                const updated = await apiPost('/orders/' + detail.value.id + '/receive_paper/', body);
+                detail.value = updated;  // 服务端返回最新订单（含已领/未领/库存/流水）
+                ElMessage.success(updated.receive_message || '领料成功');
+                receiveDialog.value = false;
+                load();
+                emit('refresh-dashboard');
+            } catch (e) { ElMessage.error(e.message); }
+        }
         async function saveRework() {
             if (!rform.description) { ElMessage.warning('请填写问题描述'); return; }
             try {
@@ -750,11 +883,12 @@ const Orders = {
             loading, orders, customers, papers, machines, filters,
             formVisible, editing, form, detailVisible, detail,
             progressDialog, pform, schedDialog, sform, reworkDialog, rform,
+            receiveDialog, receiveForm, receivePercent,
             ORDER_STATUS, STAGE_STATUS, STAGES, REWORK_STATUS, REWORK_REASONS, WARNING_LEVEL,
             formatNum, stageClass, activeStage, progressStatus, canMarkDone,
             load, reset, openCreate, openEdit, saveOrder, openDetail,
             openProgress, saveProgress, openSchedule, saveSchedule, toggleSchedule,
-            openRework, saveRework,
+            openRework, saveRework, openReceive, receiveAll, doReceive,
         };
     },
 };

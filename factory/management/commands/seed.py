@@ -194,10 +194,15 @@ class Command(BaseCommand):
             result='200 本全部重订，全检后入库；已对装订机订头做校准保养。',
         )
 
-        # ---------------- 用纸出库流水 ----------------
-        for order in [o1, o2, o3, o4, o5, o7, o8]:
+        # ---------------- 用纸领料流水 ----------------
+        # (订单, 已领张数)：o4/o6 尚未领料，o5/o8 分批领了一部分，其余已领足
+        receives = [
+            (o1, 6200), (o2, 8300), (o3, 26000),
+            (o5, 5000), (o7, 13500), (o8, 2000),
+        ]
+        for order, qty in receives:
             PaperTransaction.objects.create(
-                paper=order.paper, tx_type='out', quantity=order.paper_consumption,
+                paper=order.paper, tx_type='out', quantity=qty,
                 order=order, tx_date=order.order_date + timedelta(days=1),
                 note=f'{order.order_no} 生产领料',
             )
