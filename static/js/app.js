@@ -20,9 +20,15 @@ const STAGE_STATUS = {
     rework:      { label: '返工中', type: 'danger' },
 };
 const STAGES = [
-    { key: 'prepress', label: '印前', status: 'prepress_status', progress: 'prepress_progress', note: 'prepress_note' },
-    { key: 'printing', label: '印刷', status: 'printing_status', progress: 'printing_progress', note: 'printing_note' },
-    { key: 'binding',  label: '装订', status: 'binding_status',  progress: 'binding_progress',  note: 'binding_note' },
+    { key: 'prepress', label: '印前', status: 'prepress_status', progress: 'prepress_progress',
+      actual: 'prepress_actual_qty', qualified: 'prepress_qualified_qty',
+      rework: 'prepress_rework_qty', waste: 'prepress_waste_qty', note: 'prepress_note' },
+    { key: 'printing', label: '印刷', status: 'printing_status', progress: 'printing_progress',
+      actual: 'printing_actual_qty', qualified: 'printing_qualified_qty',
+      rework: 'printing_rework_qty', waste: 'printing_waste_qty', note: 'printing_note' },
+    { key: 'binding',  label: '装订', status: 'binding_status',  progress: 'binding_progress',
+      actual: 'binding_actual_qty', qualified: 'binding_qualified_qty',
+      rework: 'binding_rework_qty', waste: 'binding_waste_qty', note: 'binding_note' },
 ];
 const PAPER_TYPES = { coated: '铜版纸', offset: '胶版纸', whiteboard: '白卡纸', kraft: '牛皮纸', special: '特种纸' };
 const MACHINE_STATUS = { running: { label: '生产中', type: 'success' }, idle: { label: '空闲', type: 'info' }, maintenance: { label: '维保中', type: 'warning' } };
@@ -291,6 +297,10 @@ const Orders = {
                 <div class="progress-cell" v-if="activeStage(row)">
                   <el-progress :percentage="row.progress[activeStage(row).progress]" :status="progressStatus(row, activeStage(row).key)" :stroke-width="10"></el-progress>
                 </div>
+                <div v-if="row.progress && row.progress.binding_actual_qty" class="qty-cell">
+                  装订产量 <span :class="qtyDiffClass(row.progress.binding_actual_qty, row.quantity)">{{ formatNum(row.progress.binding_actual_qty) }}</span>
+                  / 印数 {{ formatNum(row.quantity) }}
+                </div>
               </div>
             </template>
           </el-table-column>
@@ -392,15 +402,41 @@ const Orders = {
           </el-descriptions>
 
           <div class="panel" style="box-shadow:none;border:1px solid #ebeef5">
-            <div class="panel-title">工序进度（印前 → 印刷 → 装订）
-              <el-button type="primary" size="small" @click="openProgress">更新进度</el-button>
+            <div class="panel-title">工序进度与产量（印前 → 印刷 → 装订）
+              <el-button type="primary" size="small" @click="openProgress">更新进度/登记产量</el-button>
             </div>
+
+            <!-- 累计产量与印数核对提示 -->
+            <el-alert
+              :title="outputAlert.title"
+              :type="outputAlert.type"
+              :closable="false"
+              show-icon
+              style="margin-bottom:14px">
+              <template #default>
+                <span>{{ outputAlert.text }}</span>
+                <span v-if="totalWaste > 0" style="margin-left:6px">三道工序累计损耗 {{ formatNum(totalWaste) }} 份（含返工 {{ formatNum(totalRework) }} 份）。</span>
+              </template>
+            </el-alert>
+
             <el-row :gutter="16">
               <el-col :span="8" v-for="st in STAGES" :key="st.key">
                 <el-card shadow="never" style="text-align:center">
                   <div style="font-weight:600;margin-bottom:8px">{{ st.label }}</div>
                   <el-tag :type="STAGE_STATUS[detail.progress[st.status]].type" size="small">{{ STAGE_STATUS[detail.progress[st.status]].label }}</el-tag>
                   <el-progress :percentage="detail.progress[st.progress]" :status="progressStatus(detail, st.key)" style="margin-top:12px"></el-progress>
+                  <div v-if="detail.progress[st.actual]" class="stage-qty">
+                    <div class="qty-row"><span>实际产量</span><b>{{ formatNum(detail.progress[st.actual]) }}</b></div>
+                    <div class="qty-row"><span>合格数</span><b class="qty-ok">{{ formatNum(detail.progress[st.qualified]) }}</b></div>
+                    <div class="qty-row"><span>损耗(含返工{{ formatNum(detail.progress[st.rework]) }})</span><b class="qty-bad">{{ formatNum(detail.progress[st.waste]) }}</b></div>
+                    <div class="qty-row" v-if="st.key !== 'prepress'">
+                      <span>对印数{{ formatNum(detail.quantity) }}</span>
+                      <el-tag :type="qtyDiffTag(detail.progress[st.actual], detail.quantity)" size="small">
+                        {{ qtyDiffText(detail.progress[st.actual], detail.quantity) }}
+                      </el-tag>
+                    </div>
+                  </div>
+                  <div v-else class="muted" style="margin-top:8px">尚未登记产量</div>
                   <div class="muted" style="margin-top:6px;min-height:32px">{{ detail.progress[st.note] || '—' }}</div>
                 </el-card>
               </el-col>
@@ -456,15 +492,41 @@ const Orders = {
       </el-drawer>
 
       <!-- 更新工序进度 -->
-      <el-dialog v-model="progressDialog" title="更新工序进度" width="560px">
+      <el-dialog v-model="progressDialog" title="更新工序进度 / 登记产量" width="640px">
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom:14px">
+          订单印数 <b>{{ formatNum(detail.quantity) }}</b> 份；开工时实际产量与合格数默认取印数，可按班组上报修改。损耗 = 实际产量 − 合格数 + 返工数量。
+        </el-alert>
         <el-form label-width="70px">
           <el-form-item v-for="st in STAGES" :key="st.key" :label="st.label">
             <div style="width:100%">
-              <el-radio-group v-model="pform[st.status]" size="small" style="margin-bottom:10px">
+              <el-radio-group v-model="pform[st.status]" size="small" style="margin-bottom:10px"
+                @change="onStageStatusChange(st)">
                 <el-radio-button v-for="(ss, sk) in STAGE_STATUS" :key="sk" :label="sk"
                   :disabled="sk==='rework' || (sk==='done' && !canMarkDone(st.key))">{{ ss.label }}</el-radio-button>
               </el-radio-group>
-              <el-slider v-model="pform[st.progress]" :show-input="true" :max="100"></el-slider>
+              <el-slider v-model="pform[st.progress]" :show-input="true" :max="100"
+                         :disabled="pform[st.status]==='not_started'"></el-slider>
+              <el-row :gutter="12" style="margin-top:6px" v-if="pform[st.status]!=='not_started'">
+                <el-col :span="12">
+                  <div class="muted" style="font-size:12px;margin-bottom:2px">实际产量(份)</div>
+                  <el-input-number v-model="pform[st.actual]" :min="0" :step="100"
+                    style="width:100%" controls-position="right"></el-input-number>
+                </el-col>
+                <el-col :span="12">
+                  <div class="muted" style="font-size:12px;margin-bottom:2px">合格数(份)</div>
+                  <el-input-number v-model="pform[st.qualified]" :min="0" :step="100"
+                    style="width:100%" controls-position="right"></el-input-number>
+                </el-col>
+              </el-row>
+              <div v-if="pform[st.status]!=='not_started'" style="margin:6px 0 2px;display:flex;justify-content:space-between;align-items:center">
+                <el-button link type="primary" size="small" @click="fillOrderQty(st)">取订单印数 {{ formatNum(detail.quantity) }}</el-button>
+                <span style="font-size:12px">
+                  <span class="muted">返工 {{ formatNum(detail.progress[st.rework]) }} 份</span>
+                  ，本工序损耗
+                  <b :class="stageWaste(st) > 0 ? 'qty-bad' : 'qty-ok'">{{ formatNum(stageWaste(st)) }}</b> 份
+                  <el-tag v-if="pform[st.qualified] > pform[st.actual]" type="danger" size="small" style="margin-left:6px">合格数不能大于实际产量</el-tag>
+                </span>
+              </div>
               <el-input v-model="pform[st.note]" placeholder="工序说明（如：正在调墨/待覆膜）" size="small" style="margin-top:6px"></el-input>
             </div>
           </el-form-item>
@@ -603,6 +665,59 @@ const Orders = {
             return '';
         }
 
+        // ---- 产量核对 ----
+        function qtyDiff(actual, target) {
+            return Number(actual || 0) - Number(target || 0);
+        }
+        function qtyDiffClass(actual, target) {
+            const d = qtyDiff(actual, target);
+            return d < 0 ? 'qty-bad' : d > 0 ? 'qty-warn' : 'qty-ok';
+        }
+        function qtyDiffTag(actual, target) {
+            const d = qtyDiff(actual, target);
+            return d < 0 ? 'danger' : d > 0 ? 'warning' : 'success';
+        }
+        function qtyDiffText(actual, target) {
+            const d = qtyDiff(actual, target);
+            if (d < 0) return `少 ${formatNum(-d)} 份`;
+            if (d > 0) return `多 ${formatNum(d)} 份`;
+            return '与印数一致';
+        }
+
+        // 累计产量核对：以装订实际产量作为最终交付产量与订单印数比对
+        const outputAlert = computed(() => {
+            const p = detail.value.progress;
+            if (!p) return { type: 'info', title: '', text: '' };
+            const qty = detail.value.quantity;
+            const binding = Number(p.binding_actual_qty || 0);
+            const printing = Number(p.printing_actual_qty || 0);
+            if (binding > 0) {
+                const d = binding - qty;
+                if (d === 0) return { type: 'success', title: '累计产量与印数一致',
+                    text: `装订累计产量 ${formatNum(binding)} 份，与订单印数 ${formatNum(qty)} 份相符。` };
+                return {
+                    type: 'warning',
+                    title: d < 0 ? '累计产量少于印数，尚不能齐套交货' : '累计产量多于印数，请核实超印数量',
+                    text: `装订累计产量 ${formatNum(binding)} 份，订单印数 ${formatNum(qty)} 份，${qtyDiffText(binding, qty)}。`,
+                };
+            }
+            if (printing > 0) {
+                const d = printing - qty;
+                return {
+                    type: 'warning',
+                    title: d === 0 ? '印刷产量已达印数，等待装订核对' : '累计产量与印数存在差异',
+                    text: `装订尚未登记产量；当前印刷累计产量 ${formatNum(printing)} 份，${d === 0 ? '与印数相符' : '较订单印数 ' + formatNum(qty) + ' 份' + qtyDiffText(printing, qty)}。`,
+                };
+            }
+            return { type: 'info', title: '尚未登记产量',
+                text: `印前 / 印刷开工后可在“更新进度/登记产量”中登记实际产量与合格数，默认取订单印数 ${formatNum(qty)} 份。` };
+        });
+
+        const totalRework = computed(() => STAGES.reduce(
+            (a, st) => a + Number(detail.value.progress?.[st.rework] || 0), 0));
+        const totalWaste = computed(() => STAGES.reduce(
+            (a, st) => a + Number(detail.value.progress?.[st.waste] || 0), 0));
+
         // 工序顺序：印刷完成要求印前完成；装订完成要求印前、印刷都完成
         function canMarkDone(stage) {
             if (stage === 'prepress') return true;
@@ -675,19 +790,59 @@ const Orders = {
             STAGES.forEach(st => {
                 pform[st.status] = p[st.status];
                 pform[st.progress] = p[st.progress];
+                pform[st.actual] = p[st.actual];
+                pform[st.qualified] = p[st.qualified];
                 pform[st.note] = p[st.note] || '';
             });
             progressDialog.value = true;
         }
+
+        // 工序由未开始切换为开工时，实际产量/合格数默认取订单印数
+        function onStageStatusChange(st) {
+            const status = pform[st.status];
+            if (status === 'not_started') {
+                pform[st.progress] = 0;
+                pform[st.actual] = 0;
+                pform[st.qualified] = 0;
+                return;
+            }
+            if (!pform[st.actual]) {
+                pform[st.actual] = detail.value.quantity;
+                pform[st.qualified] = detail.value.quantity;
+            }
+            if (status === 'done') pform[st.progress] = 100;
+        }
+
+        function fillOrderQty(st) {
+            pform[st.actual] = detail.value.quantity;
+            pform[st.qualified] = detail.value.quantity;
+        }
+
+        // 对话框内实时损耗（返工数量取服务端最新值，本工序全部返工单）
+        function stageWaste(st) {
+            const rework = Number(detail.value.progress?.[st.rework] || 0);
+            const actual = Number(pform[st.actual] || 0);
+            const qualified = Number(pform[st.qualified] || 0);
+            return actual - qualified + rework;
+        }
+
         async function saveProgress() {
             try {
-                // 已完成必须 100；未开始必须 0
+                // 已完成必须 100；未开始必须 0 且不登记产量
                 for (const st of STAGES) {
                     if (pform[st.status] === 'done') pform[st.progress] = 100;
-                    if (pform[st.status] === 'not_started') pform[st.progress] = 0;
+                    if (pform[st.status] === 'not_started') {
+                        pform[st.progress] = 0;
+                        pform[st.actual] = 0;
+                        pform[st.qualified] = 0;
+                    }
+                    if (pform[st.qualified] > pform[st.actual]) {
+                        ElMessage.warning(`${st.label}的合格数不能大于实际产量`);
+                        return;
+                    }
                 }
                 await apiPatch('/orders/' + detail.value.id + '/progress/', { ...pform });
-                ElMessage.success('工序进度已更新');
+                ElMessage.success('工序进度与产量已更新');
                 progressDialog.value = false;
                 await refreshDetail();
                 load();
@@ -752,8 +907,10 @@ const Orders = {
             progressDialog, pform, schedDialog, sform, reworkDialog, rform,
             ORDER_STATUS, STAGE_STATUS, STAGES, REWORK_STATUS, REWORK_REASONS, WARNING_LEVEL,
             formatNum, stageClass, activeStage, progressStatus, canMarkDone,
+            qtyDiffClass, qtyDiffTag, qtyDiffText, outputAlert, totalRework, totalWaste,
             load, reset, openCreate, openEdit, saveOrder, openDetail,
-            openProgress, saveProgress, openSchedule, saveSchedule, toggleSchedule,
+            openProgress, onStageStatusChange, fillOrderQty, stageWaste, saveProgress,
+            openSchedule, saveSchedule, toggleSchedule,
             openRework, saveRework,
         };
     },

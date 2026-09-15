@@ -41,34 +41,92 @@ class ProcessProgressSerializer(serializers.ModelSerializer):
     printing_status_display = serializers.CharField(source='get_printing_status_display', read_only=True)
     binding_status_display = serializers.CharField(source='get_binding_status_display', read_only=True)
 
+    order_quantity = serializers.IntegerField(source='order.quantity', read_only=True)
+    prepress_rework_qty = serializers.SerializerMethodField()
+    printing_rework_qty = serializers.SerializerMethodField()
+    binding_rework_qty = serializers.SerializerMethodField()
+    prepress_waste_qty = serializers.SerializerMethodField()
+    printing_waste_qty = serializers.SerializerMethodField()
+    binding_waste_qty = serializers.SerializerMethodField()
+
     class Meta:
         model = ProcessProgress
         fields = '__all__'
         read_only_fields = ['order', 'updated_at']
 
+    # stage -> (状态, 进度%, 实际产量, 合格数, 说明)
     STAGE_ATTRS = {
-        'prepress': ('prepress_status', 'prepress_progress', 'prepress_note'),
-        'printing': ('printing_status', 'printing_progress', 'printing_note'),
-        'binding': ('binding_status', 'binding_progress', 'binding_note'),
+        'prepress': ('prepress_status', 'prepress_progress', 'prepress_actual_qty',
+                     'prepress_qualified_qty', 'prepress_note'),
+        'printing': ('printing_status', 'printing_progress', 'printing_actual_qty',
+                     'printing_qualified_qty', 'printing_note'),
+        'binding': ('binding_status', 'binding_progress', 'binding_actual_qty',
+                    'binding_qualified_qty', 'binding_note'),
     }
+
+    def _rework_map(self, obj):
+        if not hasattr(self, '_rework_cache') or self._rework_cache[0] != obj.id:
+            totals = {'prepress': 0, 'printing': 0, 'binding': 0}
+            for stage, qty in obj.order.reworks.values_list('stage', 'qty'):
+                totals[stage] = totals.get(stage, 0) + qty
+            self._rework_cache = (obj.id, totals)
+        return self._rework_cache[1]
+
+    def get_prepress_rework_qty(self, obj):
+        return self._rework_map(obj)['prepress']
+
+    def get_printing_rework_qty(self, obj):
+        return self._rework_map(obj)['printing']
+
+    def get_binding_rework_qty(self, obj):
+        return self._rework_map(obj)['binding']
+
+    def _waste(self, obj, stage):
+        fields = self.STAGE_ATTRS[stage]
+        rework = self._rework_map(obj)[stage]
+        return getattr(obj, fields[2]) - getattr(obj, fields[3]) + rework
+
+    def get_prepress_waste_qty(self, obj):
+        return self._waste(obj, 'prepress')
+
+    def get_printing_waste_qty(self, obj):
+        return self._waste(obj, 'printing')
+
+    def get_binding_waste_qty(self, obj):
+        return self._waste(obj, 'binding')
 
     def validate(self, attrs):
         # 合并实例当前值，使部分更新(PATCH)也能做整体顺序校验
         merged = {}
-        for stage, (s_field, p_field, _) in self.STAGE_ATTRS.items():
+        for stage, (s_field, p_field, a_field, q_field, _) in self.STAGE_ATTRS.items():
             merged[s_field] = attrs.get(s_field, getattr(self.instance, s_field, None))
             merged[p_field] = attrs.get(p_field, getattr(self.instance, p_field, None))
+            merged[a_field] = attrs.get(a_field, getattr(self.instance, a_field, None))
+            merged[q_field] = attrs.get(q_field, getattr(self.instance, q_field, None))
 
         # 校验进度值 0-100，状态与进度一致性
-        for stage, (s_field, p_field, _) in self.STAGE_ATTRS.items():
+        for stage, (s_field, p_field, a_field, q_field, _) in self.STAGE_ATTRS.items():
             status = attrs.get(s_field)
             progress = attrs.get(p_field)
+            actual = attrs.get(a_field)
+            qualified = attrs.get(q_field)
             if progress is not None and not 0 <= progress <= 100:
                 raise serializers.ValidationError({p_field: '进度必须在 0~100 之间'})
             if status == 'done' and progress is not None and progress < 100:
                 raise serializers.ValidationError({p_field: '状态为已完成时进度应为 100%'})
             if status == 'not_started' and progress is not None and progress > 0:
                 raise serializers.ValidationError({p_field: '状态为未开始时进度应为 0%'})
+            # 合格数不能大于实际产量（只提交其一时与库内现值比较）
+            if qualified is not None:
+                eff_actual = actual if actual is not None else getattr(self.instance, a_field, 0)
+                if qualified > eff_actual:
+                    raise serializers.ValidationError(
+                        {q_field: '合格数不能大于实际产量'})
+            # 未开始的工序不能登记正产量
+            eff_status = status if status is not None else getattr(self.instance, s_field)
+            if eff_status == 'not_started' and actual is not None and actual > 0:
+                raise serializers.ValidationError(
+                    {a_field: '工序尚未开始，不能登记产量'})
 
         # 工序顺序校验：印刷完成前印前必须完成；装订完成前印前、印刷必须完成
         if merged['printing_status'] == 'done' and merged['prepress_status'] != 'done':
@@ -88,10 +146,30 @@ class ProcessProgressSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         from django.utils import timezone
 
-        instance = super().update(instance, validated_data)
-        order = instance.order
+        # 工序由未开始转为开工、且未显式登记产量时，实际产量/合格数默认取订单印数
+        order_qty = instance.order.quantity
+        for stage, (s_field, p_field, a_field, q_field, _) in self.STAGE_ATTRS.items():
+            new_status = validated_data.get(s_field)
+            if (new_status and new_status != 'not_started'
+                    and getattr(instance, s_field) == 'not_started'
+                    and a_field not in validated_data
+                    and q_field not in validated_data
+                    and getattr(instance, a_field) == 0):
+                validated_data[a_field] = order_qty
+                validated_data[q_field] = order_qty
 
-        # 完成某工序时记录完成时间
+        instance = super().update(instance, validated_data)
+
+        # 状态回到未开始时清空产量
+        reset_fields = []
+        for stage, (s_field, p_field, a_field, q_field, _) in self.STAGE_ATTRS.items():
+            if getattr(instance, s_field) == 'not_started' \
+                    and (getattr(instance, a_field) or getattr(instance, q_field)):
+                setattr(instance, a_field, 0)
+                setattr(instance, q_field, 0)
+                reset_fields += [a_field, q_field]
+
+        # 完成某工序时记录完成时间；重新打开则清空
         finished_map = {
             'prepress': 'prepress_finished_at',
             'printing': 'printing_finished_at',
@@ -105,9 +183,11 @@ class ProcessProgressSerializer(serializers.ModelSerializer):
         for stage, ts_field in finished_map.items():
             if getattr(instance, status_map[stage]) == 'done' and not getattr(instance, ts_field):
                 setattr(instance, ts_field, timezone.now())
-            elif getattr(instance, status_map[stage]) != 'done':
+                reset_fields.append(ts_field)
+            elif getattr(instance, status_map[stage]) != 'done' and getattr(instance, ts_field):
                 setattr(instance, ts_field, None)
-        instance.save()
+                reset_fields.append(ts_field)
+        instance.save(update_fields=reset_fields or None)
         instance.sync_order_status()
         return instance
 

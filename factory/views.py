@@ -97,7 +97,8 @@ class MachineViewSet(viewsets.ModelViewSet):
 
 
 class OrderViewSet(viewsets.ModelViewSet):
-    queryset = Order.objects.select_related('customer', 'paper', 'progress').all()
+    queryset = Order.objects.select_related('customer', 'paper', 'progress') \
+        .prefetch_related('reworks', 'schedules__machine').all()
     serializer_class = OrderSerializer
 
     def get_serializer_class(self):

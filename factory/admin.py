@@ -34,6 +34,20 @@ class MachineAdmin(admin.ModelAdmin):
 class ProcessProgressInline(admin.StackedInline):
     model = ProcessProgress
     can_delete = False
+    fieldsets = (
+        ('印前', {'fields': (
+            'prepress_status', 'prepress_progress',
+            ('prepress_actual_qty', 'prepress_qualified_qty'),
+            'prepress_note', 'prepress_finished_at')}),
+        ('印刷', {'fields': (
+            'printing_status', 'printing_progress',
+            ('printing_actual_qty', 'printing_qualified_qty'),
+            'printing_note', 'printing_finished_at')}),
+        ('装订', {'fields': (
+            'binding_status', 'binding_progress',
+            ('binding_actual_qty', 'binding_qualified_qty'),
+            'binding_note', 'binding_finished_at')}),
+    )
 
 
 @admin.register(Order)

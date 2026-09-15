@@ -101,57 +101,61 @@ class Command(BaseCommand):
 
         o1, o2, o3, o4, o5, o6, o7, o8 = order_objs
 
-        # ---------------- 工序进度 ----------------
+        # ---------------- 工序进度与产量 ----------------
+        # 每道工序: (状态, 进度%, 实际产量, 合格数, 说明)；产量默认与订单印数一致，损耗含返工数量
         def set_progress(order, prepress, printing, binding):
             p = order.progress
-            (p.prepress_status, p.prepress_progress, p.prepress_note) = prepress
-            (p.printing_status, p.printing_progress, p.printing_note) = printing
-            (p.binding_status, p.binding_progress, p.binding_note) = binding
+            (p.prepress_status, p.prepress_progress,
+             p.prepress_actual_qty, p.prepress_qualified_qty, p.prepress_note) = prepress
+            (p.printing_status, p.printing_progress,
+             p.printing_actual_qty, p.printing_qualified_qty, p.printing_note) = printing
+            (p.binding_status, p.binding_progress,
+             p.binding_actual_qty, p.binding_qualified_qty, p.binding_note) = binding
             p.save()
             p.sync_order_status()
 
-        # 订单1：印刷色差返工（逾期）
+        # 订单1：印刷色差返工（逾期）——印刷超印 500、不合格 300、返工 1500
         set_progress(o1,
-                     ('done', 100, '制版校对完成'),
-                     ('rework', 70, '首批封面偏红，停机调墨返工'),
-                     ('not_started', 0, ''))
+                     ('done', 100, 5000, 4980, '制版校对完成'),
+                     ('rework', 70, 5500, 5200, '首批封面偏红，停机调墨返工'),
+                     ('not_started', 0, 0, 0, ''))
         # 订单2：印刷中，交期紧急（2天）
         set_progress(o2,
-                     ('done', 100, '刀版与色彩管理完成'),
-                     ('in_progress', 55, '已完成正面印刷，待印反面'),
-                     ('not_started', 0, ''))
-        # 订单3：装订中
+                     ('done', 100, 8000, 7960, '刀版与色彩管理完成'),
+                     ('in_progress', 55, 4500, 4400, '已完成正面印刷，待印反面'),
+                     ('not_started', 0, 0, 0, ''))
+        # 订单3：装订中——印刷损耗 250，装订产量与印数尚未对上
         set_progress(o3,
-                     ('done', 100, '拼版打样确认'),
-                     ('done', 100, '书芯内页全部印完'),
-                     ('in_progress', 40, '胶装进行中，待三面切'))
+                     ('done', 100, 20000, 19970, '拼版打样确认'),
+                     ('done', 100, 20250, 20000, '书芯内页全部印完'),
+                     ('in_progress', 40, 12000, 11980, '胶装进行中，待三面切'))
         # 订单4：印前中
         set_progress(o4,
-                     ('in_progress', 60, '正在拼大版与数码打样'),
-                     ('not_started', 0, ''),
-                     ('not_started', 0, ''))
+                     ('in_progress', 60, 8000, 8000, '正在拼大版与数码打样'),
+                     ('not_started', 0, 0, 0, ''),
+                     ('not_started', 0, 0, 0, ''))
         # 订单5：印刷中
         set_progress(o5,
-                     ('done', 100, '纸袋展开刀模确认'),
-                     ('in_progress', 30, '1号机上机，专色调试中'),
-                     ('not_started', 0, ''))
+                     ('done', 100, 15000, 14980, '纸袋展开刀模确认'),
+                     ('in_progress', 30, 5000, 4900, '1号机上机，专色调试中'),
+                     ('not_started', 0, 0, 0, ''))
         # 订单6：待排产
         set_progress(o6,
-                     ('not_started', 0, ''),
-                     ('not_started', 0, ''),
-                     ('not_started', 0, ''))
-        # 订单7：已完成
+                     ('not_started', 0, 0, 0, ''),
+                     ('not_started', 0, 0, 0, ''),
+                     ('not_started', 0, 0, 0, ''))
+        # 订单7：已完成——装订返工 200 本重订，最终产量与印数一致
         set_progress(o7,
-                     ('done', 100, ''),
-                     ('done', 100, ''),
-                     ('done', 100, '骑订入库'))
+                     ('done', 100, 10000, 9990, ''),
+                     ('done', 100, 10200, 10000, ''),
+                     ('done', 100, 10000, 10000, '骑订入库，200本重订后全检合格'))
         o7.completed_date = today - timedelta(days=5)
         o7.save()
         # 订单8：印前中，交期明天
         set_progress(o8,
-                     ('in_progress', 80, '封面特种纸工艺确认中（烫银+UV）'),
-                     ('not_started', 0, ''),
-                     ('not_started', 0, ''))
+                     ('in_progress', 80, 2000, 2000, '封面特种纸工艺确认中（烫银+UV）'),
+                     ('not_started', 0, 0, 0, ''),
+                     ('not_started', 0, 0, 0, ''))
 
         # ---------------- 排产计划 ----------------
         schedules = [

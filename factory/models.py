@@ -123,16 +123,22 @@ class ProcessProgress(models.Model):
     order = models.OneToOneField(Order, on_delete=models.CASCADE, related_name='progress')
     prepress_status = models.CharField('印前状态', max_length=20, choices=State.choices, default=State.NOT_STARTED)
     prepress_progress = models.PositiveSmallIntegerField('印前进度%', default=0)
+    prepress_actual_qty = models.PositiveIntegerField('印前实际产量(份)', default=0)
+    prepress_qualified_qty = models.PositiveIntegerField('印前合格数(份)', default=0)
     prepress_note = models.CharField('印前说明', max_length=200, blank=True)
     prepress_finished_at = models.DateTimeField('印前完成时间', null=True, blank=True)
 
     printing_status = models.CharField('印刷状态', max_length=20, choices=State.choices, default=State.NOT_STARTED)
     printing_progress = models.PositiveSmallIntegerField('印刷进度%', default=0)
+    printing_actual_qty = models.PositiveIntegerField('印刷实际产量(份)', default=0)
+    printing_qualified_qty = models.PositiveIntegerField('印刷合格数(份)', default=0)
     printing_note = models.CharField('印刷说明', max_length=200, blank=True)
     printing_finished_at = models.DateTimeField('印刷完成时间', null=True, blank=True)
 
     binding_status = models.CharField('装订状态', max_length=20, choices=State.choices, default=State.NOT_STARTED)
     binding_progress = models.PositiveSmallIntegerField('装订进度%', default=0)
+    binding_actual_qty = models.PositiveIntegerField('装订实际产量(份)', default=0)
+    binding_qualified_qty = models.PositiveIntegerField('装订合格数(份)', default=0)
     binding_note = models.CharField('装订说明', max_length=200, blank=True)
     binding_finished_at = models.DateTimeField('装订完成时间', null=True, blank=True)
 
@@ -143,13 +149,38 @@ class ProcessProgress(models.Model):
         verbose_name_plural = verbose_name
 
     STAGE_FIELDS = {
-        Stage.PREPRESS: ('prepress_status', 'prepress_progress', 'prepress_note', 'prepress_finished_at'),
-        Stage.PRINTING: ('printing_status', 'printing_progress', 'printing_note', 'printing_finished_at'),
-        Stage.BINDING: ('binding_status', 'binding_progress', 'binding_note', 'binding_finished_at'),
+        Stage.PREPRESS: ('prepress_status', 'prepress_progress',
+                         'prepress_actual_qty', 'prepress_qualified_qty',
+                         'prepress_note', 'prepress_finished_at'),
+        Stage.PRINTING: ('printing_status', 'printing_progress',
+                         'printing_actual_qty', 'printing_qualified_qty',
+                         'printing_note', 'printing_finished_at'),
+        Stage.BINDING: ('binding_status', 'binding_progress',
+                        'binding_actual_qty', 'binding_qualified_qty',
+                        'binding_note', 'binding_finished_at'),
     }
 
     def stage_state(self, stage):
         return getattr(self, self.STAGE_FIELDS[stage][0])
+
+    def stage_actual_qty(self, stage):
+        """本工序实际产量"""
+        return getattr(self, self.STAGE_FIELDS[stage][2])
+
+    def stage_qualified_qty(self, stage):
+        """本工序合格数"""
+        return getattr(self, self.STAGE_FIELDS[stage][3])
+
+    def stage_rework_qty(self, stage):
+        """本工序全部返工单的返工数量（含已闭环，均计入损耗）"""
+        return sum(
+            r.qty for r in self.order.reworks.all() if r.stage == stage
+        )
+
+    def stage_waste_qty(self, stage):
+        """本工序损耗 = 实际产量 - 合格数 + 返工数量（返工件按损耗计）"""
+        return self.stage_actual_qty(stage) - self.stage_qualified_qty(stage) \
+            + self.stage_rework_qty(stage)
 
     def sync_order_status(self):
         """根据三道工序状态与返工单，重新计算订单状态"""

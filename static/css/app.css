@@ -64,3 +64,12 @@ html, body { margin: 0; padding: 0; height: 100%; font-family: "Helvetica Neue",
 
 .schedule-item { display:flex; align-items:flex-start; gap:8px; padding:8px 10px; margin-bottom:8px; border-radius:6px; background:#ecf5ff; border-left:3px solid #409eff; }
 .schedule-item.done { background:#f0f9eb; border-left-color:#67c23a; opacity:.85; }
+
+/* 工序产量登记与核对 */
+.qty-cell { font-size: 12px; color: #606266; margin-top: 4px; }
+.qty-ok { color: #67c23a; font-weight: 700; }
+.qty-warn { color: #e6a23c; font-weight: 700; }
+.qty-bad { color: #f56c6c; font-weight: 700; }
+.stage-qty { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #ebeef5; text-align: left; }
+.stage-qty .qty-row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; line-height: 1.9; color: #606266; }
+.stage-qty .qty-row b { color: #303133; }
