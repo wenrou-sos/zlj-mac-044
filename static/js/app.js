@@ -1310,7 +1310,12 @@ const Schedules = {
         const maintRecords = ref([]);
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
-        function disableFutureDate(d) { return d.getTime() > Date.now() - 8.64e6; }
+        // 仅禁用晚于“今天”的日期：按本地日历日期比较，避免凌晨时分把当天误判为未来
+        function disableFutureDate(d) {
+            const now = new Date();
+            const today0 = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            return new Date(d.getFullYear(), d.getMonth(), d.getDate()) > today0;
+        }
 
         const machineRows = computed(() => machines.value.map(m => {
             const items = schedules.value.filter(s => s.machine === m.id);
