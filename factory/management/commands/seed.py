@@ -11,6 +11,7 @@ from factory.models import (
     PaperTransaction,
     ReworkRecord,
     Schedule,
+    ShiftHandover,
 )
 
 
@@ -20,6 +21,7 @@ class Command(BaseCommand):
     @transaction.atomic
     def handle(self, *args, **options):
         # 清空业务数据（保留用户/权限）
+        ShiftHandover.objects.all().delete()
         ReworkRecord.objects.all().delete()
         Schedule.objects.all().delete()
         Order.objects.all().delete()
@@ -175,6 +177,26 @@ class Command(BaseCommand):
                 planned_qty=plan, actual_qty=actual, done=done,
             )
 
+        # ---------------- 交接班记录 ----------------
+        handovers = [
+            # (机台, 日期, 班次, 计划, 实际, 值班人, 异常说明, 交接事项)
+            (machines[1], today - timedelta(days=1), '白班', 4000, 4200, '李班长', '',
+             '礼盒正面全部印完并过版纸核对，今日白班转印反面；注意对照签样跟踪墨色。'),
+            (machines[1], today, '白班', 4000, 3000, '李班长',
+             '14:20 专色油墨批次偏深，停机调墨约 40 分钟，当班少产约 1000 份。',
+             '夜班继续印反面，水墨平衡已调好；前 200 张加强抽检背面蹭脏。'),
+            (machines[4], today, '白班', 10000, 4000, '王组长', '',
+             '胶装进行中，三面切未开始；夜班注意胶温保持 160℃±5，勤清胶锅。'),
+            (machines[0], today, '夜班', 2000, 0, '张师傅', '',
+             '夜班优先完成 DD20260901-01 封面返工，先签样确认色差再批量过纸。'),
+        ]
+        for (machine, d, shift, plan, actual, officer, abnormal, note) in handovers:
+            ShiftHandover.objects.create(
+                machine=machine, work_date=d, shift=shift,
+                planned_qty=plan, actual_qty=actual, duty_officer=officer,
+                abnormal_note=abnormal, handover_note=note,
+            )
+
         # ---------------- 返工单 ----------------
         rw1 = ReworkRecord.objects.create(
             order=o1, stage='printing', reason='color', qty=1500,
@@ -215,5 +237,5 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f'样例数据生成完成：客户 {customers.__len__()} 家、纸张 {len(papers_data)} 种、'
             f'机台 {len(machines)} 台、订单 {len(orders_spec)} 个、'
-            f'排产 {len(schedules)} 条、返工单 2 张'
+            f'排产 {len(schedules)} 条、交接班记录 {len(handovers)} 条、返工单 2 张'
         ))

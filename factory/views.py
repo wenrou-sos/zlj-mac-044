@@ -1,3 +1,5 @@
+from datetime import date as date_cls
+
 from django.db import transaction
 from django.db.models import Count, Sum
 from .models import today
@@ -14,6 +16,7 @@ from .models import (
     ProcessProgress,
     ReworkRecord,
     Schedule,
+    ShiftHandover,
 )
 from .serializers import (
     CustomerSerializer,
@@ -25,6 +28,7 @@ from .serializers import (
     ProcessProgressSerializer,
     ReworkSerializer,
     ScheduleSerializer,
+    ShiftHandoverSerializer,
 )
 
 
@@ -218,6 +222,104 @@ class PaperTransactionViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = None
 
 
+class ShiftHandoverViewSet(viewsets.ModelViewSet):
+    """交接班记录：按日期+班次生成，同机台同日同班次唯一"""
+
+    queryset = ShiftHandover.objects.select_related('machine').all()
+    serializer_class = ShiftHandoverSerializer
+    pagination_class = None
+
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        date = request.query_params.get('date')
+        shift = request.query_params.get('shift')
+        machine_id = request.query_params.get('machine')
+        if date:
+            qs = qs.filter(work_date=date)
+        if shift:
+            qs = qs.filter(shift=shift)
+        if machine_id:
+            qs = qs.filter(machine_id=machine_id)
+        if request.query_params.get('abnormal') == '1':
+            qs = qs.exclude(abnormal_note='')
+        return Response(self.get_serializer(qs, many=True).data)
+
+    @staticmethod
+    def _parse_date(raw):
+        """解析 YYYY-MM-DD；非法返回 None"""
+        if not raw:
+            return None
+        try:
+            return date_cls.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @action(detail=False, methods=['post'])
+    def generate(self, request):
+        """按日期（可指定班次）从排产汇总生成交接记录。
+
+        已存在的记录只刷新计划/实际产量，保留值班人填写的异常说明与交接事项。
+        """
+        work_date = self._parse_date(request.data.get('date'))
+        if not work_date:
+            return Response({'detail': '请提供正确的日期（YYYY-MM-DD）'}, status=400)
+        shift = (request.data.get('shift') or '').strip()
+
+        schedules = Schedule.objects.filter(planned_date=work_date)
+        if shift:
+            schedules = schedules.filter(shift=shift)
+        agg = (schedules.values('machine_id', 'shift')
+               .annotate(plan=Sum('planned_qty'), act=Sum('actual_qty')))
+
+        created = updated = 0
+        with transaction.atomic():
+            for row in agg:
+                _, was_created = ShiftHandover.objects.update_or_create(
+                    machine_id=row['machine_id'], work_date=work_date, shift=row['shift'],
+                    defaults={'planned_qty': row['plan'], 'actual_qty': row['act']},
+                )
+                created += 1 if was_created else 0
+                updated += 0 if was_created else 1
+
+        records = self.get_queryset().filter(work_date=work_date)
+        if shift:
+            records = records.filter(shift=shift)
+        return Response({
+            'created': created,
+            'updated': updated,
+            'records': self.get_serializer(records, many=True).data,
+        })
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        """指定日期（默认今天）的整体达成率与各班次日结"""
+        work_date = self._parse_date(request.query_params.get('date')) or today()
+        qs = self.get_queryset().filter(work_date=work_date)
+
+        shifts = []
+        for row in qs.values('shift').annotate(plan=Sum('planned_qty'), act=Sum('actual_qty'), cnt=Count('id')):
+            shifts.append({
+                'shift': row['shift'],
+                'planned': row['plan'],
+                'actual': row['act'],
+                'rate': round(row['act'] / row['plan'] * 100, 1) if row['plan'] else None,
+                'count': row['cnt'],
+            })
+        shifts.sort(key=lambda s: s['shift'])
+
+        total_plan = sum(s['planned'] for s in shifts)
+        total_act = sum(s['actual'] for s in shifts)
+        return Response({
+            'date': work_date,
+            'planned': total_plan,
+            'actual': total_act,
+            'rate': round(total_act / total_plan * 100, 1) if total_plan else None,
+            'record_count': qs.count(),
+            'abnormal_count': qs.exclude(abnormal_note='').count(),
+            'shifts': shifts,
+        })
+
+
 class DashboardViewSet(viewsets.ViewSet):
     """看板统计数据"""
 
@@ -273,6 +375,26 @@ class DashboardViewSet(viewsets.ViewSet):
             'binding': orders.filter(progress__binding_status__in=['in_progress', 'rework']).count(),
         }
 
+        # 今日产出：整体达成率 + 分班次（取自当天排产实际/计划）
+        today_qs = Schedule.objects.filter(planned_date=cur)
+        today_shifts = []
+        for row in today_qs.values('shift').annotate(plan=Sum('planned_qty'), act=Sum('actual_qty')):
+            today_shifts.append({
+                'shift': row['shift'],
+                'planned': row['plan'],
+                'actual': row['act'],
+                'rate': round(row['act'] / row['plan'] * 100, 1) if row['plan'] else None,
+            })
+        today_shifts.sort(key=lambda s: s['shift'])
+        t_plan = sum(s['planned'] for s in today_shifts)
+        t_act = sum(s['actual'] for s in today_shifts)
+        today_output = {
+            'planned': t_plan,
+            'actual': t_act,
+            'rate': round(t_act / t_plan * 100, 1) if t_plan else None,
+            'shifts': today_shifts,
+        }
+
         return Response({
             'summary': {
                 'total_orders': orders.count(),
@@ -293,4 +415,5 @@ class DashboardViewSet(viewsets.ViewSet):
             'low_papers': low_papers,
             'stage_stats': stage_stats,
             'weekly_load': load,
+            'today_output': today_output,
         })

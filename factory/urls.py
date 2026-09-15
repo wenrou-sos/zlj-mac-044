@@ -10,6 +10,7 @@ from .views import (
     PaperViewSet,
     ReworkViewSet,
     ScheduleViewSet,
+    ShiftHandoverViewSet,
 )
 
 router = DefaultRouter()
@@ -19,6 +20,7 @@ router.register('machines', MachineViewSet, basename='machine')
 router.register('orders', OrderViewSet, basename='order')
 router.register('schedules', ScheduleViewSet, basename='schedule')
 router.register('reworks', ReworkViewSet, basename='rework')
+router.register('handovers', ShiftHandoverViewSet, basename='handover')
 router.register('paper-transactions', PaperTransactionViewSet, basename='papertransaction')
 router.register('dashboard', DashboardViewSet, basename='dashboard')
 

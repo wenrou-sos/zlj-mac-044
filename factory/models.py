@@ -241,6 +241,37 @@ class ReworkRecord(models.Model):
         return f'返工单 {self.id} - {self.order.order_no}'
 
 
+class ShiftHandover(models.Model):
+    """班次交接记录：同一机台同一天同一班次仅一条"""
+
+    machine = models.ForeignKey(Machine, verbose_name='机台', on_delete=models.CASCADE, related_name='handovers')
+    work_date = models.DateField('生产日期')
+    shift = models.CharField('班次', max_length=10, default='白班')
+    planned_qty = models.PositiveIntegerField('计划产量(份)', default=0)
+    actual_qty = models.PositiveIntegerField('实际产量(份)', default=0)
+    abnormal_note = models.TextField('异常说明', blank=True)
+    handover_note = models.TextField('交接事项', blank=True)
+    duty_officer = models.CharField('值班人', max_length=50, blank=True)
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+    updated_at = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        verbose_name = '交接班记录'
+        verbose_name_plural = verbose_name
+        ordering = ['-work_date', 'shift', 'machine_id']
+        unique_together = ('machine', 'work_date', 'shift')
+
+    def __str__(self):
+        return f'{self.work_date} {self.shift} {self.machine}'
+
+    @property
+    def completion_rate(self):
+        """完成率%；无计划量时返回 None"""
+        if not self.planned_qty:
+            return None
+        return round(self.actual_qty / self.planned_qty * 100, 1)
+
+
 class PaperTransaction(models.Model):
     """纸张出入库流水"""
 

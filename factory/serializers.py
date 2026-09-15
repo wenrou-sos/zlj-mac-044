@@ -10,6 +10,7 @@ from .models import (
     ProcessProgress,
     ReworkRecord,
     Schedule,
+    ShiftHandover,
 )
 
 
@@ -233,6 +234,38 @@ class ReworkSerializer(serializers.ModelSerializer):
                 progress.save(update_fields=[stage_status_field])
             progress.sync_order_status()
         return instance
+
+
+class ShiftHandoverSerializer(serializers.ModelSerializer):
+    machine_name = serializers.CharField(source='machine.name', read_only=True)
+    machine_type = serializers.CharField(source='machine.machine_type', read_only=True)
+    completion_rate = serializers.SerializerMethodField()
+    has_abnormal = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShiftHandover
+        fields = '__all__'
+        read_only_fields = ['created_at', 'updated_at']
+        validators = []  # 唯一性在 validate() 中给出中文提示
+
+    def get_completion_rate(self, obj):
+        return obj.completion_rate
+
+    def get_has_abnormal(self, obj):
+        return bool(obj.abnormal_note and obj.abnormal_note.strip())
+
+    def validate(self, attrs):
+        machine = attrs.get('machine', getattr(self.instance, 'machine', None))
+        work_date = attrs.get('work_date', getattr(self.instance, 'work_date', None))
+        shift = attrs.get('shift', getattr(self.instance, 'shift', None))
+        if machine and work_date and shift:
+            qs = ShiftHandover.objects.filter(machine=machine, work_date=work_date, shift=shift)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError(
+                    {'shift': f'{work_date} {shift} {machine.name} 已存在交接记录，请直接编辑原记录'})
+        return attrs
 
 
 class PaperTransactionSerializer(serializers.ModelSerializer):

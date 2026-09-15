@@ -75,7 +75,7 @@ const Dashboard = {
     template: `
     <div v-loading="loading">
       <el-row :gutter="16">
-        <el-col :span="6" v-for="card in cards" :key="card.key">
+        <el-col :span="card.span" v-for="card in cards" :key="card.key">
           <div class="stat-card" @click="card.to && go(card.to)">
             <div class="icon" :style="{ background: card.color }">{{ card.icon }}</div>
             <div>
@@ -181,15 +181,20 @@ const Dashboard = {
         const data = reactive({
             summary: {}, status_counts: {}, overdue_orders: [], urgent_orders: [],
             warning_orders: [], low_papers: [], stage_stats: {}, weekly_load: [],
+            today_output: { planned: 0, actual: 0, rate: null, shifts: [] },
         });
         const machines = ref([]);
 
-        const cards = computed(() => [
-            { key: 'active', label: '在制订单', value: data.summary.active_orders ?? '-', icon: '📋', color: '#409eff', to: null },
-            { key: 'overdue', label: '逾期订单', value: data.summary.overdue_count ?? '-', icon: '🚨', color: '#f56c6c', to: null },
-            { key: 'rework', label: '未闭环返工', value: data.summary.open_rework_count ?? '-', icon: '🔧', color: '#e6a23c', to: 'reworks' },
-            { key: 'low', label: '纸张低库存', value: data.summary.low_paper_count ?? '-', icon: '📦', color: '#909399', to: 'papers' },
-        ]);
+        const cards = computed(() => {
+            const t = data.today_output || {};
+            return [
+                { key: 'active', label: '在制订单', value: data.summary.active_orders ?? '-', icon: '📋', color: '#409eff', to: null, span: 5 },
+                { key: 'overdue', label: '逾期订单', value: data.summary.overdue_count ?? '-', icon: '🚨', color: '#f56c6c', to: null, span: 5 },
+                { key: 'rework', label: '未闭环返工', value: data.summary.open_rework_count ?? '-', icon: '🔧', color: '#e6a23c', to: 'reworks', span: 5 },
+                { key: 'low', label: '纸张低库存', value: data.summary.low_paper_count ?? '-', icon: '📦', color: '#909399', to: 'papers', span: 5 },
+                { key: 'rate', label: `今日达成率（${formatNum(t.actual || 0)}/${formatNum(t.planned || 0)}）`, value: t.rate === null || t.rate === undefined ? '—' : t.rate + '%', icon: '🎯', color: '#67c23a', to: 'handovers', span: 4 },
+            ];
+        });
 
         const warnList = computed(() => ({
             overdue: data.overdue_orders, urgent: data.urgent_orders, warning: data.warning_orders,
@@ -1425,6 +1430,330 @@ const Reworks = {
 window.__APP_COMPONENTS__.Reworks = Reworks;
 
 /* ============================================================
+ * 视图六：交接班记录（按日期+班次生成，自动汇总机台产量）
+ * ============================================================ */
+const Handovers = {
+    template: `
+    <div v-loading="loading">
+      <el-row :gutter="16">
+        <el-col :span="6">
+          <div class="stat-card" style="cursor:default">
+            <div class="icon" :style="{ background: rateColor(summary.rate) }">🎯</div>
+            <div>
+              <div class="num">{{ summary.rate === null ? '—' : summary.rate + '%' }}</div>
+              <div class="label">{{ curDate }} 整体达成率</div>
+            </div>
+          </div>
+        </el-col>
+        <el-col :span="6">
+          <div class="stat-card" style="cursor:default">
+            <div class="icon" style="background:#409eff">📋</div>
+            <div>
+              <div class="num">{{ formatNum(summary.planned) }}</div>
+              <div class="label">当日计划总量（份）</div>
+            </div>
+          </div>
+        </el-col>
+        <el-col :span="6">
+          <div class="stat-card" style="cursor:default">
+            <div class="icon" style="background:#67c23a">✅</div>
+            <div>
+              <div class="num">{{ formatNum(summary.actual) }}</div>
+              <div class="label">当日实际产量（份）</div>
+            </div>
+          </div>
+        </el-col>
+        <el-col :span="6">
+          <div class="stat-card" style="cursor:default">
+            <div class="icon" :style="{ background: summary.abnormal_count ? '#f56c6c' : '#909399' }">⚠️</div>
+            <div>
+              <div class="num">{{ summary.abnormal_count }}</div>
+              <div class="label">异常机台（台）</div>
+            </div>
+          </div>
+        </el-col>
+      </el-row>
+
+      <div class="panel" style="margin-top:16px">
+        <el-form :inline="true" @submit.prevent>
+          <el-form-item label="日期">
+            <el-date-picker v-model="curDate" type="date" value-format="YYYY-MM-DD" :clearable="false" @change="load"></el-date-picker>
+          </el-form-item>
+          <el-form-item>
+            <el-button @click="shiftDay(-1)">← 前一天</el-button>
+            <el-button @click="goToday">今天</el-button>
+            <el-button @click="shiftDay(1)">后一天 →</el-button>
+          </el-form-item>
+          <el-form-item label="班次">
+            <el-radio-group v-model="shiftFilter" @change="load">
+              <el-radio-button label="">全部</el-radio-button>
+              <el-radio-button label="白班">白班</el-radio-button>
+              <el-radio-button label="夜班">夜班</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item>
+            <el-checkbox v-model="onlyAbnormal" @change="load">仅看异常</el-checkbox>
+          </el-form-item>
+          <el-form-item style="float:right">
+            <el-button @click="openManual">+ 手动补录</el-button>
+            <el-button type="primary" @click="generate">生成交接记录</el-button>
+          </el-form-item>
+        </el-form>
+
+        <div v-if="summary.shifts.length" style="margin-bottom:12px">
+          <el-tag v-for="s in summary.shifts" :key="s.shift" effect="plain"
+                  :type="s.rate === null ? 'info' : s.rate >= 100 ? 'success' : 'warning'"
+                  style="margin-right:10px">
+            {{ s.shift }}：实际 {{ formatNum(s.actual) }} / 计划 {{ formatNum(s.planned) }} 份<template v-if="s.rate !== null">（{{ s.rate }}%）</template>
+          </el-tag>
+        </div>
+
+        <el-table :data="records" border stripe
+                  empty-text="该日期暂无交接记录，点击右上角「生成交接记录」自动汇总当班各机台产量">
+          <el-table-column label="机台" min-width="180">
+            <template #default="{ row }">
+              <div style="font-weight:600">{{ row.machine_name }}</div>
+              <div class="muted">{{ row.machine_type }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="班次" width="80">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.shift==='夜班' ? 'info' : 'warning'" effect="plain">{{ row.shift }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="计划量(份)" width="110" align="right">
+            <template #default="{ row }">{{ formatNum(row.planned_qty) }}</template>
+          </el-table-column>
+          <el-table-column label="实际产量(份)" width="110" align="right">
+            <template #default="{ row }">{{ formatNum(row.actual_qty) }}</template>
+          </el-table-column>
+          <el-table-column label="完成率" width="180">
+            <template #default="{ row }">
+              <el-progress v-if="row.completion_rate !== null" :stroke-width="12"
+                           :percentage="Math.min(row.completion_rate, 100)"
+                           :color="rateColor(row.completion_rate)"
+                           :format="() => row.completion_rate + '%'"></el-progress>
+              <span v-else class="muted">无计划</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="异常说明" min-width="210">
+            <template #default="{ row }">
+              <span v-if="row.abnormal_note" style="color:#f56c6c">{{ row.abnormal_note }}</span>
+              <span v-else class="muted">无异常</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="交接事项" min-width="210">
+            <template #default="{ row }">
+              <span v-if="row.handover_note">{{ row.handover_note }}</span>
+              <span v-else class="muted">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="值班人" width="90">
+            <template #default="{ row }">{{ row.duty_officer || '—' }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="130" fixed="right">
+            <template #default="{ row }">
+              <el-button link type="primary" size="small" @click="openEdit(row)">填写交接</el-button>
+              <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+
+      <!-- 填写交接 -->
+      <el-dialog v-model="editVisible" :title="'填写交接 — ' + (editRow ? editRow.machine_name : '')" width="580px">
+        <template v-if="editRow">
+          <el-descriptions :column="3" border size="small" style="margin-bottom:16px">
+            <el-descriptions-item label="日期">{{ editRow.work_date }}</el-descriptions-item>
+            <el-descriptions-item label="班次">{{ editRow.shift }}</el-descriptions-item>
+            <el-descriptions-item label="完成率">
+              <span :style="{ color: rateColor(editRow.completion_rate), fontWeight: 700 }">
+                {{ editRow.completion_rate === null ? '—' : editRow.completion_rate + '%' }}
+              </span>
+            </el-descriptions-item>
+            <el-descriptions-item label="计划量">{{ formatNum(editRow.planned_qty) }} 份</el-descriptions-item>
+            <el-descriptions-item label="实际产量">{{ formatNum(editRow.actual_qty) }} 份</el-descriptions-item>
+            <el-descriptions-item label="机台">{{ editRow.machine_name }}</el-descriptions-item>
+          </el-descriptions>
+          <el-form :model="form" label-width="82px">
+            <el-form-item label="值班人">
+              <el-input v-model="form.duty_officer" placeholder="当班负责人"></el-input>
+            </el-form-item>
+            <el-form-item label="异常说明">
+              <el-input v-model="form.abnormal_note" type="textarea" :rows="3"
+                        placeholder="设备故障 / 品质异常 / 待料停机……无异常可留空"></el-input>
+            </el-form-item>
+            <el-form-item label="交接事项">
+              <el-input v-model="form.handover_note" type="textarea" :rows="3"
+                        placeholder="下一班需要继续跟进或注意的事项"></el-input>
+            </el-form-item>
+          </el-form>
+          <div class="muted">产量数据来自「机台排产」，如需修正请调整排产后重新生成交接记录（已填内容会保留）。</div>
+        </template>
+        <template #footer>
+          <el-button @click="editVisible=false">取消</el-button>
+          <el-button type="primary" @click="saveEdit">保存</el-button>
+        </template>
+      </el-dialog>
+
+      <!-- 手动补录 -->
+      <el-dialog v-model="manualVisible" title="手动补录交接记录" width="440px">
+        <el-form :model="manualForm" label-width="82px">
+          <el-form-item label="生产日期">
+            <span style="font-weight:600">{{ curDate }}</span>
+          </el-form-item>
+          <el-form-item label="机台" required>
+            <el-select v-model="manualForm.machine" style="width:100%">
+              <el-option v-for="m in machines" :key="m.id" :label="m.name + '（' + m.machine_type + '）'" :value="m.id"></el-option>
+            </el-select>
+          </el-form-item>
+          <el-form-item label="班次" required>
+            <el-select v-model="manualForm.shift" style="width:100%">
+              <el-option label="白班" value="白班"></el-option>
+              <el-option label="夜班" value="夜班"></el-option>
+            </el-select>
+          </el-form-item>
+        </el-form>
+        <div class="muted">用于无排产但需要交接的机台（如设备故障停机）；同一机台同一天同一班次仅一条记录。</div>
+        <template #footer>
+          <el-button @click="manualVisible=false">取消</el-button>
+          <el-button type="primary" @click="saveManual">创建并填写</el-button>
+        </template>
+      </el-dialog>
+    </div>`,
+    setup() {
+        const loading = ref(false);
+        const curDate = ref(todayStr());
+        const shiftFilter = ref('');
+        const onlyAbnormal = ref(false);
+        const records = ref([]);
+        const machines = ref([]);
+        const summary = reactive({ planned: 0, actual: 0, rate: null, record_count: 0, abnormal_count: 0, shifts: [] });
+
+        const editVisible = ref(false);
+        const editRow = ref(null);
+        const form = reactive({ duty_officer: '', abnormal_note: '', handover_note: '' });
+
+        const manualVisible = ref(false);
+        const manualForm = reactive({ machine: null, shift: '白班' });
+
+        function formatNum(n) { return Number(n || 0).toLocaleString(); }
+        function rateColor(rate) {
+            if (rate === null || rate === undefined) return '#909399';
+            if (rate >= 100) return '#67c23a';
+            if (rate >= 80) return '#e6a23c';
+            return '#f56c6c';
+        }
+
+        async function load() {
+            loading.value = true;
+            try {
+                const qs = new URLSearchParams({ date: curDate.value });
+                if (shiftFilter.value) qs.append('shift', shiftFilter.value);
+                if (onlyAbnormal.value) qs.append('abnormal', '1');
+                const [recs, sum] = await Promise.all([
+                    apiGet('/handovers/?' + qs.toString()),
+                    apiGet('/handovers/summary/?date=' + curDate.value),
+                ]);
+                records.value = recs;
+                Object.assign(summary, sum);
+            } catch (e) { ElMessage.error(e.message); } finally { loading.value = false; }
+        }
+        function shiftDay(delta) {
+            const d = new Date(curDate.value);
+            d.setDate(d.getDate() + delta);
+            curDate.value = d.toISOString().slice(0, 10);
+            load();
+        }
+        function goToday() { curDate.value = todayStr(); load(); }
+
+        async function generate() {
+            const shiftText = shiftFilter.value || '全部班次';
+            try {
+                await ElMessageBox.confirm(
+                    `将按 ${curDate.value} ${shiftText} 的排产数据汇总各机台计划/实际产量；已存在的记录只刷新产量，已填写的异常说明与交接事项会保留。`,
+                    '生成交接记录',
+                    { confirmButtonText: '生成', cancelButtonText: '取消', type: 'info' },
+                );
+            } catch (e) { return; }
+            try {
+                const body = { date: curDate.value };
+                if (shiftFilter.value) body.shift = shiftFilter.value;
+                const res = await apiPost('/handovers/generate/', body);
+                if (!res.created && !res.updated) ElMessage.info('该日期班次暂无排产数据，未生成记录');
+                else ElMessage.success(`已生成 ${res.created} 条、刷新 ${res.updated} 条交接记录`);
+                load();
+            } catch (e) { ElMessage.error(e.message); }
+        }
+
+        function openEdit(row) {
+            editRow.value = row;
+            Object.assign(form, {
+                duty_officer: row.duty_officer || '',
+                abnormal_note: row.abnormal_note || '',
+                handover_note: row.handover_note || '',
+            });
+            editVisible.value = true;
+        }
+        async function saveEdit() {
+            try {
+                await apiPatch('/handovers/' + editRow.value.id + '/', { ...form });
+                ElMessage.success('交接记录已保存');
+                editVisible.value = false;
+                load();
+            } catch (e) { ElMessage.error(e.message); }
+        }
+        async function remove(row) {
+            try {
+                await ElMessageBox.confirm(
+                    `确定删除 ${row.machine_name} ${row.work_date} ${row.shift} 的交接记录？`,
+                    '删除记录',
+                    { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+                );
+            } catch (e) { return; }
+            try {
+                await apiDel('/handovers/' + row.id + '/');
+                ElMessage.success('已删除');
+                load();
+            } catch (e) { ElMessage.error(e.message); }
+        }
+
+        function openManual() {
+            Object.assign(manualForm, {
+                machine: machines.value[0] ? machines.value[0].id : null,
+                shift: shiftFilter.value || '白班',
+            });
+            manualVisible.value = true;
+        }
+        async function saveManual() {
+            if (!manualForm.machine) { ElMessage.warning('请选择机台'); return; }
+            try {
+                const rec = await apiPost('/handovers/', {
+                    machine: manualForm.machine, work_date: curDate.value, shift: manualForm.shift,
+                });
+                ElMessage.success('已创建，请补充交接内容');
+                manualVisible.value = false;
+                await load();
+                openEdit(rec);
+            } catch (e) { ElMessage.error(e.message); }
+        }
+
+        onMounted(async () => {
+            try { machines.value = await apiGet('/machines/'); } catch (e) { ElMessage.error(e.message); }
+            load();
+        });
+
+        return {
+            loading, curDate, shiftFilter, onlyAbnormal, records, machines, summary,
+            editVisible, editRow, form, manualVisible, manualForm,
+            formatNum, rateColor, load, shiftDay, goToday, generate,
+            openEdit, saveEdit, remove, openManual, saveManual,
+        };
+    },
+};
+window.__APP_COMPONENTS__.Handovers = Handovers;
+
+/* ============================================================
  * 应用外壳：侧边栏 + 视图切换
  * ============================================================ */
 const App = {
@@ -1453,6 +1782,7 @@ const App = {
           <orders v-else-if="current==='orders'" ref="ordersRef" :key="'orders'+ordersKey" :autoStatus="orderFilter"></orders>
           <papers v-else-if="current==='papers'" :key="'papers'+papersKey"></papers>
           <schedules v-else-if="current==='schedules'" key="schedules"></schedules>
+          <handovers v-else-if="current==='handovers'" key="handovers"></handovers>
           <reworks v-else-if="current==='reworks'" :key="'reworks'+reworksKey"></reworks>
         </div>
       </div>
@@ -1471,6 +1801,7 @@ const App = {
             { key: 'orders', label: '订单管理', icon: '📋' },
             { key: 'papers', label: '纸张材料', icon: '📦' },
             { key: 'schedules', label: '机台排产', icon: '🏭' },
+            { key: 'handovers', label: '交接班记录', icon: '📝' },
             { key: 'reworks', label: '返工跟踪', icon: '🔧' },
         ];
         const currentMenu = computed(() => menus.find(m => m.key === current.value));

@@ -9,6 +9,7 @@ from .models import (
     ProcessProgress,
     ReworkRecord,
     Schedule,
+    ShiftHandover,
 )
 
 
@@ -54,6 +55,12 @@ class ScheduleAdmin(admin.ModelAdmin):
 class ReworkRecordAdmin(admin.ModelAdmin):
     list_display = ('id', 'order', 'stage', 'reason', 'qty', 'status', 'found_at', 'closed_at')
     list_filter = ('status', 'stage', 'reason')
+
+
+@admin.register(ShiftHandover)
+class ShiftHandoverAdmin(admin.ModelAdmin):
+    list_display = ('work_date', 'shift', 'machine', 'planned_qty', 'actual_qty', 'duty_officer')
+    list_filter = ('work_date', 'shift', 'machine')
 
 
 @admin.register(PaperTransaction)
