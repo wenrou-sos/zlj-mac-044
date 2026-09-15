@@ -10,7 +10,8 @@ const ORDER_STATUS = {
     prepress:  { label: '印前中', type: '' },
     printing:  { label: '印刷中', type: 'warning' },
     binding:   { label: '装订中', type: 'success' },
-    completed: { label: '已完成', type: 'success' },
+    completed: { label: '待发货', type: 'warning' },
+    shipped:   { label: '已发货', type: 'success' },
     rework:    { label: '返工中', type: 'danger' },
 };
 const STAGE_STATUS = {
@@ -34,6 +35,7 @@ const WARNING_LEVEL = {
     warning:   { label: '预警', type: 'warning' },
     normal:    { label: '正常', type: 'success' },
     completed: { label: '已完工', type: 'info' },
+    shipped:   { label: '已发货', type: 'success' },
 };
 
 /* ---------------- API 封装 ---------------- */
@@ -75,8 +77,8 @@ const Dashboard = {
     template: `
     <div v-loading="loading">
       <el-row :gutter="16">
-        <el-col :span="6" v-for="card in cards" :key="card.key">
-          <div class="stat-card" @click="card.to && go(card.to)">
+        <el-col :span="4" v-for="card in cards" :key="card.key">
+          <div class="stat-card" @click="card.orderStatus ? $emit('go-orders', card.orderStatus) : (card.to && go(card.to))">
             <div class="icon" :style="{ background: card.color }">{{ card.icon }}</div>
             <div>
               <div class="num">{{ card.value }}</div>
@@ -111,6 +113,24 @@ const Dashboard = {
                   <span :class="daysClass(row.days_left)">{{ daysText(row.days_left) }}</span>
                 </template>
               </el-table-column>
+            </el-table>
+          </div>
+
+          <div class="panel">
+            <div class="panel-title">待发货订单
+              <el-button link type="primary" size="small" @click="$emit('go-orders', 'completed')">全部 →</el-button>
+            </div>
+            <el-table :data="data.pending_shipments" size="small" @row-click="openOrder" style="cursor:pointer" empty-text="没有待发货的订单，完工订单都已发完！">
+              <el-table-column prop="order_no" label="订单编号" width="150"></el-table-column>
+              <el-table-column prop="product_name" label="产品名称" min-width="180"></el-table-column>
+              <el-table-column prop="customer_name" label="客户" width="170"></el-table-column>
+              <el-table-column label="发货进度" width="190">
+                <template #default="{ row }">
+                  <el-progress :percentage="shipPct(row)" :stroke-width="10"></el-progress>
+                  <div class="muted" style="font-size:12px">已发 {{ formatNum(row.shipped_qty) }} / {{ formatNum(row.quantity) }} 份</div>
+                </template>
+              </el-table-column>
+              <el-table-column prop="due_date" label="交期" width="110"></el-table-column>
             </el-table>
           </div>
 
@@ -180,12 +200,14 @@ const Dashboard = {
         const warnTab = ref('overdue');
         const data = reactive({
             summary: {}, status_counts: {}, overdue_orders: [], urgent_orders: [],
-            warning_orders: [], low_papers: [], stage_stats: {}, weekly_load: [],
+            warning_orders: [], pending_shipments: [], low_papers: [], stage_stats: {}, weekly_load: [],
         });
         const machines = ref([]);
 
         const cards = computed(() => [
             { key: 'active', label: '在制订单', value: data.summary.active_orders ?? '-', icon: '📋', color: '#409eff', to: null },
+            { key: 'pending_ship', label: '待发货', value: data.summary.pending_shipment_count ?? '-', icon: '🚚', color: '#e6a23c', orderStatus: 'completed' },
+            { key: 'shipped', label: '已发货', value: data.summary.shipped_count ?? '-', icon: '✅', color: '#67c23a', orderStatus: 'shipped' },
             { key: 'overdue', label: '逾期订单', value: data.summary.overdue_count ?? '-', icon: '🚨', color: '#f56c6c', to: null },
             { key: 'rework', label: '未闭环返工', value: data.summary.open_rework_count ?? '-', icon: '🔧', color: '#e6a23c', to: 'reworks' },
             { key: 'low', label: '纸张低库存', value: data.summary.low_paper_count ?? '-', icon: '📦', color: '#909399', to: 'papers' },
@@ -201,6 +223,7 @@ const Dashboard = {
         function daysText(d) { return d < 0 ? `逾期 ${-d} 天` : `剩 ${d} 天`; }
         function daysClass(d) { return d < 0 ? 'due-overdue' : d <= 2 ? 'due-urgent' : 'due-warning'; }
         function formatNum(n) { return Number(n).toLocaleString(); }
+        function shipPct(row) { return row.quantity ? Math.min(100, Math.round(row.shipped_qty / row.quantity * 100)) : 0; }
         function go(name) { emit('go', name); }
         function openOrder(row) { emit('open-order', row.id); }
 
@@ -219,7 +242,7 @@ const Dashboard = {
 
         return {
             loading, warnTab, data, machines, cards, warnList, ORDER_STATUS, MACHINE_STATUS,
-            barHeight, daysText, daysClass, formatNum, go, openOrder,
+            barHeight, daysText, daysClass, formatNum, shipPct, go, openOrder,
         };
     },
 };
@@ -276,6 +299,15 @@ const Orders = {
             <template #default="{ row }">
               <el-tag :type="ORDER_STATUS[row.status].type" size="small">{{ ORDER_STATUS[row.status].label }}</el-tag>
               <el-badge v-if="row.open_rework_count" :value="'返'+row.open_rework_count" type="danger" style="margin-left:6px" />
+            </template>
+          </el-table-column>
+          <el-table-column label="发货进度" width="140">
+            <template #default="{ row }">
+              <template v-if="row.status === 'completed' || row.status === 'shipped'">
+                <el-progress :percentage="shipPct(row)" :status="row.status === 'shipped' ? 'success' : ''" :stroke-width="10"></el-progress>
+                <div class="muted" style="font-size:12px">已发 {{ formatNum(row.shipped_qty) }} / {{ formatNum(row.quantity) }} 份</div>
+              </template>
+              <span v-else class="muted">—</span>
             </template>
           </el-table-column>
           <el-table-column label="工序进度" width="230">
@@ -407,6 +439,33 @@ const Orders = {
             </el-row>
           </div>
 
+          <div class="panel" style="box-shadow:none;border:1px solid #ebeef5;margin-top:16px">
+            <div class="panel-title">
+              发货记录（已发 {{ formatNum(detail.shipped_qty) }} / {{ formatNum(detail.quantity) }} 份）
+              <el-button v-if="detail.status==='completed'" type="primary" size="small" @click="openShip">+ 登记发货</el-button>
+              <el-tag v-else-if="detail.status==='shipped'" type="success" size="small">已全部发货</el-tag>
+              <span v-else class="muted" style="font-size:12px;font-weight:normal">订单完工后可登记发货</span>
+            </div>
+            <el-table :data="detail.shipments" size="small" border empty-text="暂无发货记录">
+              <el-table-column prop="ship_date" label="发货日期" width="110"></el-table-column>
+              <el-table-column label="数量" width="110">
+                <template #default="{ row }">{{ formatNum(row.quantity) }} 份</template>
+              </el-table-column>
+              <el-table-column prop="receiver" label="收货人" width="110"></el-table-column>
+              <el-table-column label="物流单号" min-width="150">
+                <template #default="{ row }">{{ row.tracking_no || '—' }}</template>
+              </el-table-column>
+              <el-table-column label="备注" min-width="140">
+                <template #default="{ row }">{{ row.note || '—' }}</template>
+              </el-table-column>
+              <el-table-column label="操作" width="70">
+                <template #default="{ row }">
+                  <el-button link type="danger" size="small" @click="removeShipment(row)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+
           <el-row :gutter="16" style="margin-top:16px">
             <el-col :span="13">
               <div class="panel" style="box-shadow:none;border:1px solid #ebeef5">
@@ -472,6 +531,33 @@ const Orders = {
         <template #footer>
           <el-button @click="progressDialog=false">取消</el-button>
           <el-button type="primary" @click="saveProgress">保存</el-button>
+        </template>
+      </el-dialog>
+
+      <!-- 登记发货对话框 -->
+      <el-dialog v-model="shipDialog" title="登记发货" width="480px">
+        <el-alert type="info" :closable="false" style="margin-bottom:14px"
+          :title="'印数 ' + formatNum(detail.quantity) + ' 份，已发 ' + formatNum(detail.shipped_qty) + ' 份，还可发 ' + formatNum(detail.remaining_qty) + ' 份'"></el-alert>
+        <el-form :model="shform" label-width="82px">
+          <el-form-item label="发货数量" required>
+            <el-input-number v-model="shform.quantity" :min="1" :max="detail.remaining_qty" :step="500" style="width:100%"></el-input-number>
+          </el-form-item>
+          <el-form-item label="发货日期" required>
+            <el-date-picker v-model="shform.ship_date" type="date" value-format="YYYY-MM-DD" style="width:100%"></el-date-picker>
+          </el-form-item>
+          <el-form-item label="收货人" required>
+            <el-input v-model="shform.receiver" placeholder="收货联系人"></el-input>
+          </el-form-item>
+          <el-form-item label="物流单号">
+            <el-input v-model="shform.tracking_no" placeholder="快递 / 物流单号"></el-input>
+          </el-form-item>
+          <el-form-item label="备注">
+            <el-input v-model="shform.note" placeholder="如：第二批，走顺丰"></el-input>
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="shipDialog=false">取消</el-button>
+          <el-button type="primary" @click="saveShipment">确认发货</el-button>
         </template>
       </el-dialog>
 
@@ -581,10 +667,14 @@ const Orders = {
         const schedDialog = ref(false);
         const sform = reactive({ machine: null, planned_date: todayStr(), shift: '白班', planned_qty: 0, actual_qty: 0, remark: '' });
 
+        const shipDialog = ref(false);
+        const shform = reactive({ quantity: 0, ship_date: todayStr(), receiver: '', tracking_no: '', note: '' });
+
         const reworkDialog = ref(false);
         const rform = reactive({ stage: 'printing', reason: 'color', qty: 100, handler: '', found_at: todayStr(), description: '' });
 
         function formatNum(n) { return Number(n || 0).toLocaleString(); }
+        function shipPct(row) { return row.quantity ? Math.min(100, Math.round(row.shipped_qty / row.quantity * 100)) : 0; }
 
         function stageClass(row, key) {
             const s = row.progress[key + '_status'];
@@ -724,6 +814,45 @@ const Orders = {
             Object.assign(rform, { stage: 'printing', reason: 'color', qty: 100, handler: '', found_at: todayStr(), description: '' });
             reworkDialog.value = true;
         }
+
+        function openShip() {
+            // 收货人默认带入客户联系人，可改
+            const cust = customers.value.find(c => c.id === detail.value.customer);
+            Object.assign(shform, {
+                quantity: detail.value.remaining_qty,
+                ship_date: todayStr(),
+                receiver: cust ? cust.contact : '',
+                tracking_no: '', note: '',
+            });
+            shipDialog.value = true;
+        }
+        async function saveShipment() {
+            if (!shform.quantity || shform.quantity < 1) { ElMessage.warning('请填写发货数量'); return; }
+            if (!shform.ship_date) { ElMessage.warning('请选择发货日期'); return; }
+            if (!shform.receiver) { ElMessage.warning('请填写收货人'); return; }
+            try {
+                await apiPost('/shipments/', { order: detail.value.id, ...shform });
+                ElMessage.success('发货已登记');
+                shipDialog.value = false;
+                await refreshDetail();
+                load();
+                emit('refresh-dashboard');
+            } catch (e) { ElMessage.error(e.message); }
+        }
+        async function removeShipment(row) {
+            try {
+                await ElMessageBox.confirm(
+                    `确认删除 ${row.ship_date} 发货 ${formatNum(row.quantity)} 份的记录？订单发货状态将同步回退。`,
+                    '删除发货记录', { type: 'warning' });
+            } catch (e) { return; }
+            try {
+                await apiDel('/shipments/' + row.id + '/');
+                ElMessage.success('发货记录已删除');
+                await refreshDetail();
+                load();
+                emit('refresh-dashboard');
+            } catch (e) { ElMessage.error(e.message); }
+        }
         async function saveRework() {
             if (!rform.description) { ElMessage.warning('请填写问题描述'); return; }
             try {
@@ -750,11 +879,12 @@ const Orders = {
             loading, orders, customers, papers, machines, filters,
             formVisible, editing, form, detailVisible, detail,
             progressDialog, pform, schedDialog, sform, reworkDialog, rform,
+            shipDialog, shform,
             ORDER_STATUS, STAGE_STATUS, STAGES, REWORK_STATUS, REWORK_REASONS, WARNING_LEVEL,
-            formatNum, stageClass, activeStage, progressStatus, canMarkDone,
+            formatNum, shipPct, stageClass, activeStage, progressStatus, canMarkDone,
             load, reset, openCreate, openEdit, saveOrder, openDetail,
             openProgress, saveProgress, openSchedule, saveSchedule, toggleSchedule,
-            openRework, saveRework,
+            openRework, saveRework, openShip, saveShipment, removeShipment,
         };
     },
 };
@@ -910,7 +1040,7 @@ const Papers = {
             try {
                 [papers.value, txs.value, activeOrders.value] = await Promise.all([
                     apiGet('/papers/'), apiGet('/paper-transactions/'),
-                    apiGet('/orders/').then(os => os.filter(o => o.status !== 'completed')),
+                    apiGet('/orders/').then(os => os.filter(o => o.status !== 'completed' && o.status !== 'shipped')),
                 ]);
             } catch (e) { ElMessage.error(e.message); } finally { loading.value = false; }
         }
@@ -1152,7 +1282,7 @@ const Schedules = {
             try {
                 await loadMachines();
                 await loadSchedules();
-                activeOrders.value = (await apiGet('/orders/')).filter(o => o.status !== 'completed');
+                activeOrders.value = (await apiGet('/orders/')).filter(o => o.status !== 'completed' && o.status !== 'shipped');
             } finally { loading.value = false; }
         }
         function shiftDay(delta) {

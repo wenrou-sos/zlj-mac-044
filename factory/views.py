@@ -1,5 +1,6 @@
 from django.db import transaction
 from django.db.models import Count, Sum
+from django.db.models.functions import Coalesce
 from .models import today
 from rest_framework import viewsets
 from rest_framework.response import Response
@@ -14,6 +15,7 @@ from .models import (
     ProcessProgress,
     ReworkRecord,
     Schedule,
+    Shipment,
 )
 from .serializers import (
     CustomerSerializer,
@@ -25,6 +27,7 @@ from .serializers import (
     ProcessProgressSerializer,
     ReworkSerializer,
     ScheduleSerializer,
+    ShipmentSerializer,
 )
 
 
@@ -97,7 +100,8 @@ class MachineViewSet(viewsets.ModelViewSet):
 
 
 class OrderViewSet(viewsets.ModelViewSet):
-    queryset = Order.objects.select_related('customer', 'paper', 'progress').all()
+    queryset = Order.objects.select_related('customer', 'paper', 'progress').annotate(
+        shipped_qty_annotated=Coalesce(Sum('shipments__quantity'), 0)).all()
     serializer_class = OrderSerializer
 
     def get_serializer_class(self):
@@ -119,7 +123,7 @@ class OrderViewSet(viewsets.ModelViewSet):
             qs = qs.filter(order_no__icontains=keyword) | qs.filter(product_name__icontains=keyword)
         if warning and warning != 'all':
             cur = today()
-            active = qs.exclude(status=Order.Status.COMPLETED)
+            active = qs.exclude(status__in=(Order.Status.COMPLETED, Order.Status.SHIPPED))
             ids = []
             for o in active:
                 days = (o.due_date - cur).days
@@ -212,6 +216,22 @@ class ReworkViewSet(viewsets.ModelViewSet):
         progress.sync_order_status()
 
 
+class ShipmentViewSet(viewsets.ModelViewSet):
+    """发货记录：新建/删除后由信号联动订单的 待发货/已发货 状态"""
+
+    queryset = Shipment.objects.select_related('order').all()
+    serializer_class = ShipmentSerializer
+    # 发货记录只增删，不提供修改，避免数量被改乱；改错可删除后重录
+    http_method_names = ['get', 'post', 'delete', 'head', 'options']
+
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        order_id = request.query_params.get('order')
+        if order_id:
+            qs = qs.filter(order_id=order_id)
+        return Response(self.get_serializer(qs, many=True).data)
+
+
 class PaperTransactionViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = PaperTransaction.objects.select_related('paper', 'order').all()
     serializer_class = PaperTransactionSerializer
@@ -223,13 +243,25 @@ class DashboardViewSet(viewsets.ViewSet):
 
     def list(self, request):
         cur = today()
-        orders = Order.objects.select_related('customer', 'paper', 'progress').all()
+        orders = Order.objects.select_related('customer', 'paper', 'progress').annotate(
+            shipped_qty_annotated=Coalesce(Sum('shipments__quantity'), 0)).all()
 
         status_counts = {c[0]: 0 for c in Order.Status.choices}
         overdue, urgent, warning = [], [], []
+        pending_shipments = []
         for o in orders:
             status_counts[o.status] = status_counts.get(o.status, 0) + 1
             if o.status == Order.Status.COMPLETED:
+                # 已完工待发货：随看板展示发货进度
+                pending_shipments.append({
+                    'id': o.id, 'order_no': o.order_no,
+                    'product_name': o.product_name,
+                    'customer_name': o.customer.name,
+                    'quantity': o.quantity, 'shipped_qty': o.shipped_qty,
+                    'due_date': o.due_date,
+                })
+                continue
+            if o.status == Order.Status.SHIPPED:
                 continue
             days = (o.due_date - cur).days
             row = {
@@ -276,8 +308,11 @@ class DashboardViewSet(viewsets.ViewSet):
         return Response({
             'summary': {
                 'total_orders': orders.count(),
-                'active_orders': orders.exclude(status=Order.Status.COMPLETED).count(),
+                'active_orders': orders.exclude(
+                    status__in=(Order.Status.COMPLETED, Order.Status.SHIPPED)).count(),
                 'completed_orders': status_counts.get('completed', 0),
+                'pending_shipment_count': status_counts.get('completed', 0),
+                'shipped_count': status_counts.get('shipped', 0),
                 'overdue_count': len(overdue),
                 'urgent_count': len(urgent),
                 'warning_count': len(warning),
@@ -290,6 +325,7 @@ class DashboardViewSet(viewsets.ViewSet):
             'overdue_orders': sorted(overdue, key=lambda x: x['days_left'])[:10],
             'urgent_orders': sorted(urgent, key=lambda x: x['days_left'])[:10],
             'warning_orders': warning[:10],
+            'pending_shipments': sorted(pending_shipments, key=lambda x: x['due_date'])[:10],
             'low_papers': low_papers,
             'stage_stats': stage_stats,
             'weekly_load': load,

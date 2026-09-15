@@ -11,6 +11,7 @@ from factory.models import (
     PaperTransaction,
     ReworkRecord,
     Schedule,
+    Shipment,
 )
 
 
@@ -20,6 +21,7 @@ class Command(BaseCommand):
     @transaction.atomic
     def handle(self, *args, **options):
         # 清空业务数据（保留用户/权限）
+        Shipment.objects.all().delete()
         ReworkRecord.objects.all().delete()
         Schedule.objects.all().delete()
         Order.objects.all().delete()
@@ -87,6 +89,8 @@ class Command(BaseCommand):
              'completed', -17, -6),
             ('DD20260913-08', 0, '企业年度精装纪念册', 2000, '250g/珠光/787×1092', 3600,
              'prepress', -1, 1),
+            ('DD20260904-09', 3, '中秋月饼礼盒包装', 8000, '300g/889×1194', 9200,
+             'completed', -11, 3),
         ]
 
         order_objs = []
@@ -99,7 +103,7 @@ class Command(BaseCommand):
             )
             order_objs.append(o)
 
-        o1, o2, o3, o4, o5, o6, o7, o8 = order_objs
+        o1, o2, o3, o4, o5, o6, o7, o8, o9 = order_objs
 
         # ---------------- 工序进度 ----------------
         def set_progress(order, prepress, printing, binding):
@@ -152,6 +156,13 @@ class Command(BaseCommand):
                      ('in_progress', 80, '封面特种纸工艺确认中（烫银+UV）'),
                      ('not_started', 0, ''),
                      ('not_started', 0, ''))
+        # 订单9：已完工，分批部分发货（待发货）
+        set_progress(o9,
+                     ('done', 100, ''),
+                     ('done', 100, ''),
+                     ('done', 100, '糊盒完成，抽检合格'))
+        o9.completed_date = today - timedelta(days=2)
+        o9.save()
 
         # ---------------- 排产计划 ----------------
         schedules = [
@@ -175,6 +186,25 @@ class Command(BaseCommand):
                 planned_qty=plan, actual_qty=actual, done=done,
             )
 
+        # ---------------- 发货记录 ----------------
+        # 订单7：分两批全部发完 → 订单自动变为「已发货」
+        Shipment.objects.create(
+            order=o7, quantity=6000, ship_date=today - timedelta(days=4),
+            receiver='赵老师', tracking_no='SF13800033333',
+            note='第一批，教材中心仓库签收',
+        )
+        Shipment.objects.create(
+            order=o7, quantity=4000, ship_date=today - timedelta(days=2),
+            receiver='赵老师', tracking_no='SF13800033334',
+            note='第二批尾数，已全部发完',
+        )
+        # 订单9：第一批部分发货 → 仍为「待发货」
+        Shipment.objects.create(
+            order=o9, quantity=3000, ship_date=today - timedelta(days=1),
+            receiver='陈芳', tracking_no='YD13800044444',
+            note='首批先走，余量本周内发完',
+        )
+
         # ---------------- 返工单 ----------------
         rw1 = ReworkRecord.objects.create(
             order=o1, stage='printing', reason='color', qty=1500,
@@ -195,7 +225,7 @@ class Command(BaseCommand):
         )
 
         # ---------------- 用纸出库流水 ----------------
-        for order in [o1, o2, o3, o4, o5, o7, o8]:
+        for order in [o1, o2, o3, o4, o5, o7, o8, o9]:
             PaperTransaction.objects.create(
                 paper=order.paper, tx_type='out', quantity=order.paper_consumption,
                 order=order, tx_date=order.order_date + timedelta(days=1),
@@ -215,5 +245,5 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f'样例数据生成完成：客户 {customers.__len__()} 家、纸张 {len(papers_data)} 种、'
             f'机台 {len(machines)} 台、订单 {len(orders_spec)} 个、'
-            f'排产 {len(schedules)} 条、返工单 2 张'
+            f'排产 {len(schedules)} 条、返工单 2 张、发货记录 3 条'
         ))

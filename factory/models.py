@@ -1,6 +1,7 @@
 from datetime import date
 
 from django.db import models
+from django.db.models import Sum
 from django.utils import timezone
 
 
@@ -81,7 +82,8 @@ class Order(models.Model):
         PREPRESS = 'prepress', '印前中'
         PRINTING = 'printing', '印刷中'
         BINDING = 'binding', '装订中'
-        COMPLETED = 'completed', '已完成'
+        COMPLETED = 'completed', '待发货'
+        SHIPPED = 'shipped', '已发货'
         REWORK = 'rework', '返工中'
 
     order_no = models.CharField('订单编号', max_length=30, unique=True)
@@ -104,6 +106,28 @@ class Order(models.Model):
 
     def __str__(self):
         return f'{self.order_no} {self.product_name}'
+
+    @property
+    def shipped_qty(self):
+        """累计已发货数量（优先使用 queryset annotate 的 shipped_qty_annotated）"""
+        annotated = getattr(self, 'shipped_qty_annotated', None)
+        if annotated is not None:
+            return annotated
+        return self.shipments.aggregate(s=Sum('quantity'))['s'] or 0
+
+    @property
+    def remaining_qty(self):
+        """剩余可发货数量"""
+        return max(self.quantity - self.shipped_qty, 0)
+
+    def sync_shipment_status(self):
+        """发货量变化后，在 待发货(completed) / 已发货(shipped) 之间切换"""
+        if self.status == Order.Status.COMPLETED and self.shipped_qty >= self.quantity:
+            self.status = Order.Status.SHIPPED
+            self.save(update_fields=['status'])
+        elif self.status == Order.Status.SHIPPED and self.shipped_qty < self.quantity:
+            self.status = Order.Status.COMPLETED
+            self.save(update_fields=['status'])
 
 
 class ProcessProgress(models.Model):
@@ -159,6 +183,10 @@ class ProcessProgress(models.Model):
         stages = [self.prepress_status, self.printing_status, self.binding_status]
         open_rework = order.reworks.exclude(status=ReworkRecord.Status.CLOSED).exists()
 
+        # 已发货订单不再随工序变动（存在未闭环返工单时除外，允许回到返工中）
+        if order.status == Order.Status.SHIPPED and not open_rework:
+            return order.status
+
         if open_rework or 'rework' in stages:
             new_status = Order.Status.REWORK
         elif self.prepress_status == 'done' and self.printing_status == 'done' \
@@ -174,8 +202,12 @@ class ProcessProgress(models.Model):
         else:
             new_status = Order.Status.PENDING
 
+        # 完工且已全部发货的订单直接置为已发货（如返工闭环后恢复）
+        if new_status == Order.Status.COMPLETED and order.shipped_qty >= order.quantity:
+            new_status = Order.Status.SHIPPED
+
         order.status = new_status
-        if new_status == Order.Status.COMPLETED:
+        if new_status in (Order.Status.COMPLETED, Order.Status.SHIPPED):
             order.completed_date = order.completed_date or today()
         else:
             order.completed_date = None
@@ -239,6 +271,26 @@ class ReworkRecord(models.Model):
 
     def __str__(self):
         return f'返工单 {self.id} - {self.order.order_no}'
+
+
+class Shipment(models.Model):
+    """发货记录：一个订单可分批多次发货"""
+
+    order = models.ForeignKey(Order, verbose_name='订单', on_delete=models.CASCADE, related_name='shipments')
+    quantity = models.PositiveIntegerField('发货数量(份)')
+    ship_date = models.DateField('发货日期')
+    receiver = models.CharField('收货人', max_length=50)
+    tracking_no = models.CharField('物流单号', max_length=100, blank=True)
+    note = models.CharField('备注', max_length=200, blank=True)
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+
+    class Meta:
+        verbose_name = '发货记录'
+        verbose_name_plural = verbose_name
+        ordering = ['ship_date', 'id']
+
+    def __str__(self):
+        return f'{self.order.order_no} 发货 {self.quantity} 份 ({self.ship_date})'
 
 
 class PaperTransaction(models.Model):

@@ -10,6 +10,7 @@ from .models import (
     ProcessProgress,
     ReworkRecord,
     Schedule,
+    Shipment,
 )
 
 
@@ -112,6 +113,40 @@ class ProcessProgressSerializer(serializers.ModelSerializer):
         return instance
 
 
+class ShipmentSerializer(serializers.ModelSerializer):
+    order_no = serializers.CharField(source='order.order_no', read_only=True)
+    product_name = serializers.CharField(source='order.product_name', read_only=True)
+
+    class Meta:
+        model = Shipment
+        fields = '__all__'
+        read_only_fields = ['created_at']
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('发货数量必须大于 0')
+        return value
+
+    def validate(self, attrs):
+        # 部分更新(PATCH)时取实例当前值合并校验
+        order = attrs.get('order', getattr(self.instance, 'order', None))
+        quantity = attrs.get('quantity', getattr(self.instance, 'quantity', 0))
+        if order is None:
+            return attrs
+        if order.status not in (Order.Status.COMPLETED, Order.Status.SHIPPED):
+            raise serializers.ValidationError(
+                {'order': '订单尚未完工，不能登记发货'})
+        # 累计发货（不含本记录自身）不能超过印数
+        shipped = order.shipped_qty
+        if self.instance is not None:
+            shipped -= self.instance.quantity
+        remaining = order.quantity - shipped
+        if quantity > remaining:
+            raise serializers.ValidationError(
+                {'quantity': f'发货数量超出印数，该订单还可发 {remaining} 份'})
+        return attrs
+
+
 class OrderListSerializer(serializers.ModelSerializer):
     """列表精简结构（含看板需要的派生字段）"""
 
@@ -122,6 +157,8 @@ class OrderListSerializer(serializers.ModelSerializer):
     warning_level = serializers.SerializerMethodField()
     progress = ProcessProgressSerializer(read_only=True)
     open_rework_count = serializers.SerializerMethodField()
+    shipped_qty = serializers.IntegerField(read_only=True)
+    remaining_qty = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Order
@@ -130,7 +167,7 @@ class OrderListSerializer(serializers.ModelSerializer):
             'quantity', 'paper', 'paper_name', 'paper_consumption',
             'status', 'status_display', 'order_date', 'due_date',
             'completed_date', 'remark', 'days_left', 'warning_level',
-            'progress', 'open_rework_count',
+            'progress', 'open_rework_count', 'shipped_qty', 'remaining_qty',
         ]
 
     def get_paper_name(self, obj):
@@ -138,12 +175,14 @@ class OrderListSerializer(serializers.ModelSerializer):
 
     def get_days_left(self, obj):
         cur = _today()
-        if obj.status == Order.Status.COMPLETED:
+        if obj.status in (Order.Status.COMPLETED, Order.Status.SHIPPED):
             return None
         return (obj.due_date - cur).days
 
     def get_warning_level(self, obj):
         """交期预警：overdue 逾期 / urgent 紧急(<=2天) / warning 预警(<=5天) / normal"""
+        if obj.status == Order.Status.SHIPPED:
+            return 'shipped'
         days = self.get_days_left(obj)
         if days is None:
             return 'completed'
@@ -162,15 +201,19 @@ class OrderListSerializer(serializers.ModelSerializer):
 class OrderSerializer(OrderListSerializer):
     schedules = serializers.SerializerMethodField()
     reworks = serializers.SerializerMethodField()
+    shipments = serializers.SerializerMethodField()
 
     class Meta(OrderListSerializer.Meta):
-        fields = OrderListSerializer.Meta.fields + ['created_at', 'schedules', 'reworks']
+        fields = OrderListSerializer.Meta.fields + ['created_at', 'schedules', 'reworks', 'shipments']
 
     def get_schedules(self, obj):
         return ScheduleSerializer(obj.schedules.select_related('machine'), many=True).data
 
     def get_reworks(self, obj):
         return ReworkSerializer(obj.reworks.all(), many=True).data
+
+    def get_shipments(self, obj):
+        return ShipmentSerializer(obj.shipments.all(), many=True).data
 
 
 class ScheduleSerializer(serializers.ModelSerializer):
