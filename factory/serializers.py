@@ -116,10 +116,18 @@ class ProcessProgressSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({p_field: '状态为已完成时进度应为 100%'})
             if status == 'not_started' and progress is not None and progress > 0:
                 raise serializers.ValidationError({p_field: '状态为未开始时进度应为 0%'})
-            # 合格数不能大于实际产量（只提交其一时与库内现值比较）
-            if qualified is not None:
-                eff_actual = actual if actual is not None else getattr(self.instance, a_field, 0)
-                if qualified > eff_actual:
+            # 合格数不能大于实际产量：只提交其一时，与库内另一值合并比较，
+            # 防止单独把实际产量改小到已登记合格数以下，导致损耗为负
+            if actual is not None or qualified is not None:
+                eff_actual = actual if actual is not None \
+                    else getattr(self.instance, a_field)
+                eff_qualified = qualified if qualified is not None \
+                    else getattr(self.instance, q_field)
+                if eff_qualified > eff_actual:
+                    if actual is not None and qualified is None:
+                        raise serializers.ValidationError(
+                            {a_field: f'实际产量不能小于已登记的合格数 {eff_qualified} 份，'
+                                      f'请先下调合格数'})
                     raise serializers.ValidationError(
                         {q_field: '合格数不能大于实际产量'})
             # 未开始的工序不能登记正产量
