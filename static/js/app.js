@@ -378,11 +378,17 @@ const Orders = {
                     ；该客户另有 {{ suggest.customer_wip.count }} 单在制、{{ formatNum(suggest.customer_wip.quantity) }} 份待排产
                   </template>
                   <br>
-                  用纸：{{ suggest.paper.name }} 库存 {{ formatNum(suggest.paper.stock) }} 张 / 需 {{ formatNum(suggest.paper.needed) }} 张
-                  <span v-if="suggest.paper.tight" style="color:#f56c6c;font-weight:600">
-                    （缺 {{ formatNum(suggest.paper.shortage) }} 张，采购到货约 {{ suggest.paper.lead_days }} 天）
-                  </span>
-                  <span v-else style="color:#67c23a">（库存够用）</span>
+                  <template v-if="suggest.paper.unknown">
+                    用纸：{{ suggest.paper.name }} 库存 {{ formatNum(suggest.paper.stock) }} 张
+                    <span style="color:#e6a23c;font-weight:600">（未填用纸量，无法核对库存）</span>
+                  </template>
+                  <template v-else>
+                    用纸：{{ suggest.paper.name }} 库存 {{ formatNum(suggest.paper.stock) }} 张 / 需 {{ formatNum(suggest.paper.needed) }} 张
+                    <span v-if="suggest.paper.tight" style="color:#f56c6c;font-weight:600">
+                      （缺 {{ formatNum(suggest.paper.shortage) }} 张，采购到货约 {{ suggest.paper.lead_days }} 天）
+                    </span>
+                    <span v-else style="color:#67c23a">（库存够用）</span>
+                  </template>
                 </div>
                 <el-alert v-if="form.due_date && form.due_date < suggest.suggested_date" type="warning"
                   :closable="false" show-icon style="margin-top:6px"
